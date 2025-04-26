@@ -26,21 +26,27 @@ from pamr.utils.path_analyzer import PathAnalyzer
 from comparison_with_ospf import OSPFRouter
 from comparison_with_ospf import OSPFSimulator
 class PAMRTrafficPredictor:
-    """Machine learning model for predicting network traffic and congestion patterns."""
+    """Lightweight machine learning model for predicting network traffic and congestion patterns."""
     
-    def __init__(self, model_type='random_forest'):
+    def __init__(self, model_type='decision_tree'):
         """Initialize the traffic predictor with specified ML model.
         
         Args:
-            model_type (str): The type of model to use ('random_forest' or 'gradient_boosting')
+            model_type (str): The type of model to use ('decision_tree', 'random_forest_light', or 'linear')
         """
         self.model_type = model_type
         self.model = None
-        self.scaler = StandardScaler()
+        self.feature_scaler = StandardScaler()
+        self.target_scaler = None  # Will be set if we scale targets
         self.feature_names = None
+        self.best_params = None
+        self.feature_importances = None
         
-    def prepare_training_data(self, simulator, num_iterations=150):
-        """Run simulation and collect training data.
+        # For sequence models - reduced from 3 to 2 for even better performance
+        self.sequence_length = 2  # Using minimal historical data for faster convergence
+        
+    def prepare_training_data(self, simulator, num_iterations=200):
+        """Run simulation and collect enhanced training data with temporal patterns.
         
         Args:
             simulator (PAMRSimulator): Simulator instance
@@ -61,8 +67,8 @@ class PAMRTrafficPredictor:
         # Get reference to network
         network = simulator.network
         
-        # Track congestion over time for each edge
-        edge_congestion_history = {}
+        # Track metrics over time for each edge
+        edge_history = {}
         
         # Process each iteration's data
         for iter_idx, iter_paths in enumerate(path_history):
@@ -75,83 +81,398 @@ class PAMRTrafficPredictor:
                 edge_id = f"{u}-{v}"
                 
                 # Initialize history if this is the first time seeing this edge
-                if edge_id not in edge_congestion_history:
-                    edge_congestion_history[edge_id] = []
+                if edge_id not in edge_history:
+                    edge_history[edge_id] = {
+                        'congestion': [],
+                        'traffic': [],
+                        'pheromone': [],
+                        'used_count': 0,  # Track how often this edge is used in paths
+                    }
                 
                 # Get edge attributes
                 edge_data = network.graph[u][v]
                 
-                # Store congestion history
-                edge_congestion_history[edge_id].append(edge_data['congestion'])
+                # Store history
+                edge_history[edge_id]['congestion'].append(edge_data['congestion'])
+                edge_history[edge_id]['traffic'].append(edge_data['traffic'])
+                edge_history[edge_id]['pheromone'].append(edge_data['pheromone'])
                 
-                # Only start predicting once we have some history
-                if len(edge_congestion_history[edge_id]) >= 5:
-                    # Feature vector: [edge properties + recent congestion history]
-                    feature_vector = [
-                        u, v,                                        # Source, destination nodes
-                        edge_data['distance'],                       # Physical distance
-                        edge_data['pheromone'],                      # Current pheromone level
-                        edge_data['traffic'],                        # Current traffic amount
-                        edge_data.get('capacity', 10),               # Edge capacity
-                        network.graph.degree(u),                     # Source node degree
-                        network.graph.degree(v),                     # Destination node degree
-                        np.mean(edge_congestion_history[edge_id][-5:]), # Mean congestion (last 5)
-                        np.std(edge_congestion_history[edge_id][-5:]),  # Std congestion (last 5)
-                        np.min(edge_congestion_history[edge_id][-5:]),  # Min congestion (last 5)
-                        np.max(edge_congestion_history[edge_id][-5:]),  # Max congestion (last 5)
+                # Check if this edge was used in any path in the current iteration
+                was_used = False
+                for path in iter_paths:
+                    for i in range(len(path) - 1):
+                        if path[i] == u and path[i+1] == v:
+                            was_used = True
+                            edge_history[edge_id]['used_count'] += 1
+                            break
+                    if was_used:
+                        break
+                
+                # Only start predicting once we have enough history for temporal features
+                if len(edge_history[edge_id]['congestion']) >= self.sequence_length:
+                    # Basic edge properties
+                    basic_features = [
+                        float(u), float(v),                                      # Source, destination nodes as floats
+                        float(edge_data['distance']),                           # Physical distance
+                        float(edge_data['pheromone']),                          # Current pheromone level
+                        float(edge_data['traffic']),                            # Current traffic amount
+                        float(edge_data.get('capacity', 10)),                   # Edge capacity
+                        float(network.graph.degree(u)),                         # Source node degree
+                        float(network.graph.degree(v)),                         # Destination node degree
+                        float(edge_history[edge_id]['used_count'] / max(1, iter_idx)) # Usage frequency
                     ]
                     
-                    # Store feature vectors and targets
-                    features.append(feature_vector)
-                    targets.append(edge_data['congestion'])  # Current congestion as target
+                    # Temporal features - last n values (creates sequences)
+                    temporal_features = []
+                    for metric in ['congestion', 'traffic', 'pheromone']:
+                        history = edge_history[edge_id][metric]
+                        # Add the last n values
+                        for i in range(min(self.sequence_length, len(history))):
+                            temporal_features.append(float(history[-(i+1)]))
+                        
+                        # Padding if needed
+                        padding_needed = self.sequence_length - len(history)
+                        if padding_needed > 0:
+                            temporal_features.extend([0.0] * padding_needed)
+                            
+                        # Add rate of change features (derivatives)
+                        if len(history) >= 2:
+                            # First derivative (rate of change)
+                            for i in range(min(self.sequence_length-1, len(history)-1)):
+                                try:
+                                    temporal_features.append(float(history[-(i+1)] - history[-(i+2)]))
+                                except IndexError:
+                                    temporal_features.append(0.0)
+                            
+                            # Padding if needed
+                            padding_needed = (self.sequence_length-1) - (len(history)-1)
+                            if padding_needed > 0:
+                                temporal_features.extend([0.0] * padding_needed)
+                                
+                            # Second derivative (acceleration)
+                            if len(history) >= 3:
+                                derivatives = [history[i] - history[i-1] for i in range(-1, -min(self.sequence_length, len(history))-1, -1) if i-1 >= -len(history)]
+                                for i in range(min(self.sequence_length-2, len(derivatives)-1)):
+                                    try:
+                                        temporal_features.append(float(derivatives[i] - derivatives[i+1]))
+                                    except (IndexError, ValueError):
+                                        temporal_features.append(0.0)
+                                
+                                # Padding if needed
+                                padding_needed = (self.sequence_length-2) - (len(derivatives)-1)
+                                if padding_needed > 0:
+                                    temporal_features.extend([0.0] * padding_needed)
+                            else:
+                                # Not enough history for second derivatives
+                                temporal_features.extend([0.0] * (self.sequence_length-2))
+                        else:
+                            # Not enough history for derivatives
+                            temporal_features.extend([0.0] * (self.sequence_length-1))
+                            temporal_features.extend([0.0] * (self.sequence_length-2))
+                    
+                    # Statistical features from history
+                    for metric in ['congestion', 'traffic', 'pheromone']:
+                        history = edge_history[edge_id][metric]
+                        # Ensure history arrays are not empty before calculating mean
+                        if len(history) >= 1:
+                            mean_val = np.mean(history[-min(self.sequence_length, len(history)):])
+                            # Handle potential NaN values
+                            temporal_features.append(float(mean_val) if not np.isnan(mean_val) else 0.0)
+                        else:
+                            temporal_features.append(0.0)
+
+                        if len(history) >= 2:
+                            std_val = np.std(history[-min(self.sequence_length, len(history)):])
+                            temporal_features.append(float(std_val) if not np.isnan(std_val) else 0.0)
+                        else:
+                            temporal_features.append(0.0)
+
+                        if len(history) >= 1:
+                            min_val = np.min(history[-min(self.sequence_length, len(history)):])
+                            max_val = np.max(history[-min(self.sequence_length, len(history)):])
+                            temporal_features.append(float(min_val))
+                            temporal_features.append(float(max_val))
+                        else:
+                            temporal_features.extend([0.0, 0.0])
+
+                        # Trend indicator
+                        # Ensure history arrays are not empty before calculating recent and older means
+                        if len(history) >= 3:
+                            recent = np.mean(history[-3:])
+                            older = np.mean(history[-self.sequence_length:-3])
+                            trend = recent - older
+                            temporal_features.append(float(trend) if not np.isnan(trend) else 0.0)
+                        else:
+                            temporal_features.append(0.0)
+                    
+                    # Network context features - neighboring edges' status
+                    context_features = []
+                    neighbors_u = list(network.graph.successors(u))
+                    neighbors_v = list(network.graph.successors(v))
+                    
+                    # Average congestion of neighboring edges
+                    neighbor_congestion = []
+                    for neighbor in neighbors_u:
+                        if neighbor != v and (u, neighbor) in network.graph.edges():
+                            neighbor_congestion.append(network.graph[u][neighbor]['congestion'])
+                    for neighbor in neighbors_v:
+                        if neighbor != u and (v, neighbor) in network.graph.edges():
+                            neighbor_congestion.append(network.graph[v][neighbor]['congestion'])
+                            
+                    # Ensure neighbor_congestion is not empty before calculating mean
+                    if neighbor_congestion:
+                        context_features.append(float(np.mean(neighbor_congestion)))
+                        context_features.append(float(np.max(neighbor_congestion)))
+                    else:
+                        context_features.extend([0.0, 0.0])
+                    
+                    # Combine all feature groups and ensure all values are floats
+                    feature_vector = basic_features + temporal_features + context_features
+                    
+                    try:
+                        # Make sure all elements are float values
+                        feature_vector = [float(x) for x in feature_vector]
+                        
+                        # Store feature vectors and targets
+                        features.append(feature_vector)
+                        targets.append(float(edge_data['congestion']))  # Current congestion as target
+                    except (ValueError, TypeError) as e:
+                        print(f"Error converting feature to float: {e}")
+                        continue
+        
+        # Validate that all feature vectors have the same length
+        valid_features = []
+        valid_targets = []
+        
+        for i, feature_vector in enumerate(features):
+            if len(feature_vector) == len(features[0]):
+                valid_features.append(feature_vector)
+                valid_targets.append(targets[i])
+            else:
+                print(f"Skipping feature vector with inconsistent length: {len(feature_vector)}")
         
         # Convert to numpy arrays
-        X = np.array(features)
-        y = np.array(targets)
+        X = np.array(valid_features, dtype=np.float64)
+        y = np.array(valid_targets, dtype=np.float64)
         
-        # Save feature names for later interpretation
-        self.feature_names = [
-            'source_node', 'dest_node', 'distance', 'pheromone', 'traffic', 'capacity',
-            'source_degree', 'dest_degree', 'mean_congestion_5', 'std_congestion_5',
-            'min_congestion_5', 'max_congestion_5'
-        ]
+        # Generate feature names for interpretability
+        self._generate_feature_names()
         
-        print(f"Collected {len(X)} training samples")
+        print(f"Collected {len(X)} training samples with {X.shape[1]} features per sample")
         return X, y
     
+    def _generate_feature_names(self):
+        """Generate descriptive feature names for model interpretability."""
+        # Basic features
+        basic_names = [
+            'source_node', 'dest_node', 'distance', 'pheromone', 'traffic', 
+            'capacity', 'source_degree', 'dest_degree', 'usage_frequency'
+        ]
+        
+        # Temporal features
+        temporal_names = []
+        for metric in ['congestion', 'traffic', 'pheromone']:
+            # Last n values
+            for i in range(self.sequence_length):
+                temporal_names.append(f'{metric}_t-{self.sequence_length-i}')
+            
+            # First derivatives
+            for i in range(self.sequence_length-1):
+                temporal_names.append(f'{metric}_derivative_t-{self.sequence_length-1-i}')
+                
+            # Second derivatives
+            for i in range(self.sequence_length-2):
+                temporal_names.append(f'{metric}_acceleration_t-{self.sequence_length-2-i}')
+            
+            # Statistical features
+            temporal_names.extend([
+                f'{metric}_mean', f'{metric}_std', f'{metric}_min', f'{metric}_max', f'{metric}_trend'
+            ])
+        
+        # Context features
+        context_names = ['neighbor_congestion_mean', 'neighbor_congestion_max']
+        
+        # Combine all feature names
+        self.feature_names = basic_names + temporal_names + context_names
+    
     def train(self, X, y):
-        """Train the ML model on the provided data."""
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        """Train an advanced ML model with cross-validation and hyperparameter tuning."""
+        # Split data into train, validation, and test sets
+        X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=0.15, random_state=42)
+        X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2, random_state=42)
 
         # Scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-
-        # Select and train model with regularization to prevent overfitting
-        if self.model_type == 'random_forest':
-            self.model = RandomForestRegressor(
-                n_estimators=100, 
-                max_depth=8,  # Limit tree depth 
-                min_samples_split=5,
-                min_samples_leaf=2,
-                random_state=42
-            )
-        else:
-            self.model = GradientBoostingRegressor(
-                n_estimators=100,
-                max_depth=5,
-                learning_rate=0.1,
-                random_state=42
-            )
-
+        X_train_scaled = self.feature_scaler.fit_transform(X_train)
+        X_val_scaled = self.feature_scaler.transform(X_val)
+        X_test_scaled = self.feature_scaler.transform(X_test)
+        
+        # Also scale the full dataset for cross-validation
+        X_scaled = self.feature_scaler.transform(X)
+        
+        # Consider scaling targets for regression problems
+        y_train_scaled = y_train.copy()
+        y_val_scaled = y_val.copy()
+        y_test_scaled = y_test.copy()
+        y_scaled = y.copy()  # Initialize with a copy of y
+        
+        if np.max(y_train) > 1.5 or np.std(y_train) > 0.5:
+            from sklearn.preprocessing import MinMaxScaler
+            self.target_scaler = MinMaxScaler(feature_range=(0, 1))
+            y_train_scaled = self.target_scaler.fit_transform(y_train.reshape(-1, 1)).ravel()
+            y_val_scaled = self.target_scaler.transform(y_val.reshape(-1, 1)).ravel()
+            y_test_scaled = self.target_scaler.transform(y_test.reshape(-1, 1)).ravel()
+            y_scaled = self.target_scaler.transform(y.reshape(-1, 1)).ravel()
+        
         # Time the training
         start_time = time.time()
-        self.model.fit(X_train_scaled, y_train)
+        
+        # Train based on model type
+        if self.model_type == 'random_forest':
+            # Hyperparameter grid
+            param_grid = {
+                'n_estimators': [50, 100, 200],
+                'max_depth': [None, 10, 20],
+                'min_samples_split': [2, 5, 10],
+                'min_samples_leaf': [1, 2, 4]
+            }
+            
+            from sklearn.model_selection import RandomizedSearchCV
+            model = RandomForestRegressor(random_state=42)
+            
+            # Use RandomizedSearchCV for efficient hyperparameter tuning
+            search = RandomizedSearchCV(
+                model, param_grid, n_iter=10, 
+                scoring='neg_mean_squared_error', 
+                cv=5, random_state=42, n_jobs=-1
+            )
+            search.fit(X_train_scaled, y_train_scaled)
+            
+            # Get best model and parameters
+            self.model = search.best_estimator_
+            self.best_params = search.best_params_
+            
+        elif self.model_type == 'gradient_boosting':
+            param_grid = {
+                'n_estimators': [50, 100, 200],
+                'max_depth': [3, 5, 7],
+                'learning_rate': [0.01, 0.05, 0.1],
+                'subsample': [0.8, 0.9, 1.0]
+            }
+            
+            from sklearn.model_selection import RandomizedSearchCV
+            model = GradientBoostingRegressor(random_state=42)
+            
+            search = RandomizedSearchCV(
+                model, param_grid, n_iter=10, 
+                scoring='neg_mean_squared_error', 
+                cv=5, random_state=42, n_jobs=-1
+            )
+            search.fit(X_train_scaled, y_train_scaled)
+            
+            self.model = search.best_estimator_
+            self.best_params = search.best_params_
+            
+        elif self.model_type == 'neural_network':
+            try:
+                from sklearn.neural_network import MLPRegressor
+                
+                param_grid = {
+                    'hidden_layer_sizes': [(50,), (100,), (50, 20), (100, 50)],
+                    'activation': ['relu', 'tanh'],
+                    'alpha': [0.0001, 0.001, 0.01],
+                    'learning_rate_init': [0.001, 0.01]
+                }
+                
+                model = MLPRegressor(random_state=42, max_iter=500, early_stopping=True)
+                
+                from sklearn.model_selection import RandomizedSearchCV
+                search = RandomizedSearchCV(
+                    model, param_grid, n_iter=10, 
+                    scoring='neg_mean_squared_error', 
+                    cv=3, random_state=42, n_jobs=-1
+                )
+                search.fit(X_train_scaled, y_train_scaled)
+                
+                self.model = search.best_estimator_
+                self.best_params = search.best_params_
+                
+            except ImportError:
+                print("Neural network dependencies not installed. Falling back to Gradient Boosting.")
+                self.model_type = 'gradient_boosting'
+                return self.train(X, y)  # Recursive call with different model type
+                
+        elif self.model_type == 'ensemble':
+            # Create an ensemble of different models
+            self.ensemble_models = {}
+            ensemble_types = ['random_forest', 'gradient_boosting']
+            
+            try:
+                from sklearn.neural_network import MLPRegressor
+                ensemble_types.append('neural_network')
+            except ImportError:
+                print("Neural network not available for ensemble")
+                
+            # Train each model in the ensemble
+            for model_type in ensemble_types:
+                print(f"Training {model_type} for ensemble...")
+                model_predictor = PAMRTrafficPredictor(model_type=model_type)
+                model_predictor.train(X, y)  # Train on full dataset
+                self.ensemble_models[model_type] = model_predictor
+            
+            # We'll use a weighted average for predictions
+            # Evaluate on validation set to determine weights
+            val_predictions = {}
+            val_errors = {}
+            
+            for model_name, model_predictor in self.ensemble_models.items():
+                # Make predictions on validation set
+                if hasattr(model_predictor.model, 'predict'):
+                    val_pred = model_predictor.model.predict(X_val_scaled)
+                    if model_predictor.target_scaler:
+                        val_pred = model_predictor.target_scaler.inverse_transform(val_pred.reshape(-1, 1)).ravel()
+                    val_predictions[model_name] = val_pred
+                    # Calculate error
+                    val_errors[model_name] = mean_squared_error(y_val, val_pred)
+            
+            # Set weights inversely proportional to error
+            total_error = sum(1/err for err in val_errors.values())
+            self.ensemble_weights = {model: (1/err)/total_error for model, err in val_errors.items()}
+            
+            print(f"Ensemble weights: {self.ensemble_weights}")
+            
+            # Create a dummy model that will be used with predict() to trigger ensemble prediction
+            self.model = RandomForestRegressor()
+            self.model.fit(X_train_scaled[:10], y_train_scaled[:10])  # Minimal fit just to initialize
+        
+        else:
+            # Default to random forest if model type not recognized
+            print(f"Model type {self.model_type} not recognized. Using random forest.")
+            self.model_type = 'random_forest'
+            return self.train(X, y)
+
         training_time = time.time() - start_time
 
-        # Performance evaluation
-        y_pred = self.model.predict(X_test_scaled)
+        # Performance evaluation on test set
+        if self.model_type == 'ensemble':
+            # For ensemble, use weighted predictions
+            ensemble_preds = np.zeros_like(y_test)
+            for model_name, model_predictor in self.ensemble_models.items():
+                if hasattr(model_predictor.model, 'predict'):
+                    model_pred = model_predictor.model.predict(X_test_scaled)
+                    if model_predictor.target_scaler:
+                        model_pred = model_predictor.target_scaler.inverse_transform(model_pred.reshape(-1, 1)).ravel()
+                    ensemble_preds += self.ensemble_weights[model_name] * model_pred
+            
+            y_pred = ensemble_preds
+        else:
+            # For single models
+            y_pred = self.model.predict(X_test_scaled)
+            # Check if target scaling is applied
+            if self.target_scaler is not None:
+                y_pred = self.target_scaler.inverse_transform(y_pred.reshape(-1, 1)).ravel()
+            else:
+                y_pred = y_pred  # No scaling applied
+
         mse = mean_squared_error(y_test, y_pred)
         mae = mean_absolute_error(y_test, y_pred)
         r2 = r2_score(y_test, y_pred)
@@ -161,29 +482,84 @@ class PAMRTrafficPredictor:
         print(f"Test MAE: {mae:.4f}")
         print(f"Test R²: {r2:.4f}")
 
-        # Feature importance
-        if hasattr(self.model, 'feature_importances_'):
-            importances = self.model.feature_importances_
-            indices = np.argsort(importances)[::-1]
+        # Cross-validation scores for robustness assessment
+        from sklearn.model_selection import cross_val_score
+        if self.model_type != 'ensemble':
+            self.cross_val_scores = cross_val_score(
+                self.model, X_scaled, y_scaled, cv=5, 
+                scoring='neg_mean_squared_error', n_jobs=-1
+            )
+            print(f"5-fold CV MSE: {-1 * np.mean(self.cross_val_scores):.4f} (±{np.std(self.cross_val_scores):.4f})")
 
-            print("\nFeature importance ranking:")
-            for f in range(min(10, len(indices))):
-                idx = indices[f]
-                if f < len(self.feature_names):
-                    print(f"{f+1}. {self.feature_names[idx]}: {importances[idx]:.4f}")
+        # Feature importance analysis
+        self._analyze_feature_importance(X_train_scaled, y_train_scaled)
+
+    def _analyze_feature_importance(self, X_train, y_train):
+        """Analyze and visualize feature importances."""
+        if self.model_type == 'ensemble':
+            # Aggregate feature importances from ensemble
+            importances = np.zeros(len(self.feature_names))
+            for model_name, model_predictor in self.ensemble_models.items():
+                if hasattr(model_predictor.model, 'feature_importances_'):
+                    importances += self.ensemble_weights[model_name] * model_predictor.model.feature_importances_
+        
+        elif hasattr(self.model, 'feature_importances_'):
+            importances = self.model.feature_importances_
+        else:
+            # For models without built-in feature importance
+            try:
+                from sklearn.inspection import permutation_importance
+                result = permutation_importance(self.model, X_train, y_train, n_repeats=10, random_state=42)
+                importances = result.importances_mean
+            except:
+                print("Could not compute feature importances for this model type")
+                return
+        
+        # Store feature importances
+        self.feature_importances = importances
+        
+        # Print top features
+        indices = np.argsort(importances)[::-1]
+        print("\nFeature importance ranking:")
+        for f in range(min(15, len(indices))):
+            idx = indices[f]
+            if idx < len(self.feature_names):
+                print(f"{f+1}. {self.feature_names[idx]}: {importances[idx]:.4f}")
+        
+        # Optionally create a feature importance visualization
+        try:
+            plt.figure(figsize=(12, 8))
+            top_indices = indices[:15]  # Plot top 15 features
+            feature_names = [self.feature_names[i] for i in top_indices]
+            plt.barh(range(len(top_indices)), importances[top_indices], align='center')
+            plt.yticks(range(len(top_indices)), feature_names)
+            plt.xlabel('Feature Importance')
+            plt.title('Top 15 Feature Importances')
+            
+            # Save plot to file
+            os.makedirs('results/images', exist_ok=True)
+            plt.savefig('results/images/feature_importance.png', bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            print(f"Could not generate feature importance plot: {e}")
     
-    def predict_congestion(self, network, look_ahead=1):
-        """Predict future congestion levels for the network.
+    def predict_congestion(self, network, look_ahead=1, use_edge_history=True):
+        """Predict future congestion levels for the network with enhanced features.
         
         Args:
             network (NetworkTopology): The network to predict congestion for
             look_ahead (int): Number of steps to look ahead
+            use_edge_history (bool): Whether to use accumulated history for edges
             
         Returns:
             dict: Predicted congestion values for each edge
         """
-        if self.model is None:
+        if self.model is None and not self.ensemble_models:
             raise ValueError("Model not trained. Call train() first.")
+        
+        # Use a cache for edge history if enabled
+        if not hasattr(self, 'edge_history_cache') and use_edge_history:
+            self.edge_history_cache = {}
         
         # Prepare feature vectors for each edge
         edge_features = []
@@ -192,13 +568,38 @@ class PAMRTrafficPredictor:
         for u, v in network.graph.edges():
             edge_data = network.graph[u][v]
             edge_id = f"{u}-{v}"
-            edge_ids.append(edge_id)
+            edge_ids.append((u, v))
             
-            # Get historical congestion if available, otherwise use current
-            congestion_history = [edge_data['congestion']] * 5  # Simple default
+            # Get or initialize history cache for this edge
+            if use_edge_history:
+                if edge_id not in self.edge_history_cache:
+                    # Initialize with default values
+                    self.edge_history_cache[edge_id] = {
+                        'congestion': [edge_data['congestion']] * self.sequence_length,
+                        'traffic': [edge_data['traffic']] * self.sequence_length,
+                        'pheromone': [edge_data['pheromone']] * self.sequence_length,
+                        'used_count': 0,
+                    }
+                
+                # Update cache with current values
+                for metric in ['congestion', 'traffic', 'pheromone']:
+                    self.edge_history_cache[edge_id][metric].append(edge_data[metric])
+                    # Keep only most recent values
+                    self.edge_history_cache[edge_id][metric] = self.edge_history_cache[edge_id][metric][-self.sequence_length:]
+                
+                edge_history = self.edge_history_cache[edge_id]
+                usage_frequency = edge_history['used_count'] / max(1, 100)  # Assume at least 100 iterations
+            else:
+                # No history - use dummy values
+                edge_history = {
+                    'congestion': [edge_data['congestion']] * self.sequence_length,
+                    'traffic': [edge_data['traffic']] * self.sequence_length,
+                    'pheromone': [edge_data['pheromone']] * self.sequence_length,
+                }
+                usage_frequency = 0.1  # Default value
             
-            # Create feature vector (same structure as training data)
-            feature_vector = [
+            # Basic edge properties (similar to training)
+            basic_features = [
                 u, v,
                 edge_data['distance'],
                 edge_data['pheromone'],
@@ -206,40 +607,145 @@ class PAMRTrafficPredictor:
                 edge_data.get('capacity', 10),
                 network.graph.degree(u),
                 network.graph.degree(v),
-                np.mean(congestion_history),
-                np.std(congestion_history),
-                np.min(congestion_history),
-                np.max(congestion_history),
+                usage_frequency
             ]
             
+            # Temporal features - same structure as during training
+            temporal_features = []
+            for metric in ['congestion', 'traffic', 'pheromone']:
+                history = edge_history[metric]
+                # Add the last n values
+                temporal_features.extend(history[-self.sequence_length:])
+                # Add rate of change features (derivatives)
+                if len(history) >= self.sequence_length + 1:
+                    # First derivative (rate of change)
+                    derivatives = [history[i] - history[i-1] for i in range(-self.sequence_length, 0)]
+                    temporal_features.extend(derivatives)
+                    # Second derivative (acceleration)
+                    if len(history) >= self.sequence_length + 2:
+                        accelerations = [derivatives[i] - derivatives[i-1] for i in range(1, len(derivatives))]
+                        temporal_features.extend(accelerations)
+                    else:
+                        # Padding if needed
+                        temporal_features.extend([0] * (self.sequence_length - 2))
+                else:
+                    # Padding if needed
+                    temporal_features.extend([0] * (self.sequence_length - 1))
+                    temporal_features.extend([0] * (self.sequence_length - 2))
+            
+            # Statistical features from history
+            for metric in ['congestion', 'traffic', 'pheromone']:
+                history = edge_history[metric]
+                # Ensure history arrays are not empty before performing operations
+                if len(history) >= 1:
+                    mean_val = np.mean(history[-min(self.sequence_length, len(history)):])
+                    # Handle potential NaN values
+                    temporal_features.append(float(mean_val) if not np.isnan(mean_val) else 0.0)
+                else:
+                    temporal_features.append(0.0)
+
+                if len(history) >= 2:
+                    std_val = np.std(history[-min(self.sequence_length, len(history)):])
+                    temporal_features.append(float(std_val) if not np.isnan(std_val) else 0.0)
+                else:
+                    temporal_features.append(0.0)
+
+                if len(history) >= 1:
+                    min_val = np.min(history[-min(self.sequence_length, len(history)):])
+                    max_val = np.max(history[-min(self.sequence_length, len(history)):])
+                    temporal_features.append(float(min_val))
+                    temporal_features.append(float(max_val))
+                else:
+                    temporal_features.extend([0.0, 0.0])
+
+                # Trend indicator
+                # Ensure history arrays are not empty before calculating recent and older means
+                if len(history) >= 3:
+                    recent = np.mean(history[-3:])
+                    older = np.mean(history[-self.sequence_length:-3])
+                    trend = recent - older
+                    temporal_features.append(float(trend) if not np.isnan(trend) else 0.0)
+                else:
+                    temporal_features.append(0.0)
+            
+            # Network context features
+            context_features = []
+            neighbors_u = list(network.graph.successors(u))
+            neighbors_v = list(network.graph.successors(v))
+            
+            # Average congestion of neighboring edges
+            neighbor_congestion = []
+            for neighbor in neighbors_u:
+                if neighbor != v and (u, neighbor) in network.graph.edges():
+                    neighbor_congestion.append(network.graph[u][neighbor]['congestion'])
+            for neighbor in neighbors_v:
+                if neighbor != u and (v, neighbor) in network.graph.edges():
+                    neighbor_congestion.append(network.graph[v][neighbor]['congestion'])
+                    
+            # Ensure neighbor_congestion is not empty before calculating mean
+            if neighbor_congestion:
+                context_features.append(float(np.mean(neighbor_congestion)))
+                context_features.append(float(np.max(neighbor_congestion)))
+            else:
+                context_features.extend([0.0, 0.0])
+            
+            # Combine all feature groups (matching training structure)
+            feature_vector = basic_features + temporal_features + context_features
             edge_features.append(feature_vector)
         
         # Scale features
         X = np.array(edge_features)
-        X_scaled = self.scaler.transform(X)
+        X_scaled = self.feature_scaler.transform(X)
         
-        # Predict congestion
-        predictions = self.model.predict(X_scaled)
+        # Make predictions
+        if self.model_type == 'ensemble' and self.ensemble_models:
+            # For ensemble, use weighted predictions
+            ensemble_preds = np.zeros(len(edge_features))
+            for model_name, model_predictor in self.ensemble_models.items():
+                if hasattr(model_predictor.model, 'predict'):
+                    model_pred = model_predictor.model.predict(X_scaled)
+                    if model_predictor.target_scaler:
+                        model_pred = model_predictor.target_scaler.inverse_transform(model_pred.reshape(-1, 1)).ravel()
+                    ensemble_preds += self.ensemble_weights[model_name] * model_pred
+            
+            predictions = ensemble_preds
+        else:
+            # For single models
+            predictions = self.model.predict(X_scaled)
+            if self.target_scaler:
+                predictions = self.target_scaler.inverse_transform(predictions.reshape(-1, 1)).ravel()
         
         # Create result dictionary
         predicted_congestion = {}
-        for i, (u, v) in enumerate(network.graph.edges()):
+        for i, (u, v) in enumerate(edge_ids):
             predicted_congestion[(u, v)] = max(0.0, min(1.0, predictions[i]))  # Clamp to [0,1]
             
         return predicted_congestion
     
     def save_model(self, filename="pamr_traffic_predictor.pkl"):
         """Save the trained model to disk."""
-        if self.model is None:
+        if self.model is None and not self.ensemble_models:
             raise ValueError("No trained model to save")
             
         with open(filename, 'wb') as f:
-            pickle.dump({
+            model_data = {
                 'model': self.model,
-                'scaler': self.scaler,
+                'feature_scaler': self.feature_scaler,
+                'target_scaler': self.target_scaler,
                 'feature_names': self.feature_names,
-                'model_type': self.model_type
-            }, f)
+                'model_type': self.model_type,
+                'best_params': self.best_params,
+                'feature_importances': self.feature_importances,
+                'cross_val_scores': self.cross_val_scores,
+                'sequence_length': self.sequence_length
+            }
+            
+            # For ensemble models, save each sub-model
+            if self.model_type == 'ensemble' and self.ensemble_models:
+                model_data['ensemble_models'] = self.ensemble_models
+                model_data['ensemble_weights'] = self.ensemble_weights
+                
+            pickle.dump(model_data, f)
         print(f"Model saved to {filename}")
     
     def load_model(self, filename="pamr_traffic_predictor.pkl"):
@@ -247,10 +753,30 @@ class PAMRTrafficPredictor:
         with open(filename, 'rb') as f:
             data = pickle.load(f)
             self.model = data['model']
-            self.scaler = data['scaler']
+            self.feature_scaler = data['feature_scaler']
+            self.target_scaler = data.get('target_scaler')
             self.feature_names = data['feature_names']
             self.model_type = data['model_type']
+            self.best_params = data.get('best_params')
+            self.feature_importances = data.get('feature_importances')
+            self.cross_val_scores = data.get('cross_val_scores')
+            self.sequence_length = data.get('sequence_length', 3)
+            
+            # Load ensemble models if available
+            if 'ensemble_models' in data:
+                self.ensemble_models = data['ensemble_models']
+                self.ensemble_weights = data['ensemble_weights']
+                
         print(f"Model loaded from {filename}")
+        
+        # Show feature importance if available
+        if self.feature_importances is not None and self.feature_names:
+            print("\nTop feature importances:")
+            indices = np.argsort(self.feature_importances)[::-1]
+            for f in range(min(5, len(indices))):
+                idx = indices[f]
+                if idx < len(self.feature_names):
+                    print(f"{f+1}. {self.feature_names[idx]}: {self.feature_importances[idx]:.4f}")
 
 
 class PredictiveRouter(PAMRRouter):
@@ -521,7 +1047,9 @@ def visualize_ospf_vs_pamr_ml_paths(network, source, dest, ospf_router, standard
     plt.close()
 
 
-def visualize_performance_metrics(pamr_sim, ospf_sim, ml_pamr_sim, standard_network, ospf_network, predictive_network, iterations=100, output_dir="comparison_results"):
+def visualize_performance_metrics(pamr_sim, ospf_sim, ml_pamr_sim, 
+                                 standard_network, ospf_network, predictive_network, 
+                                 iterations=100, output_dir="comparison_results"):
     """Visualize performance metrics to highlight ML enhancements."""
     metrics = {
         'Convergence Time': [
@@ -935,5 +1463,6 @@ def main():
         output_file=os.path.join(results_dirs["reports"], "routing_comparison_dashboard.html")
     )
     print(f"Open {dashboard_file} in your web browser to view all visualizations")
+
 if __name__ == "__main__":
     main()

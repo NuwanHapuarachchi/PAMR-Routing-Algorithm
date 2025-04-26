@@ -1,10 +1,15 @@
 class PheromoneManager:
     """Manages pheromone operations for PAMR routing."""
     
-    def __init__(self, graph, evaporation_rate=0.15, min_pheromone=0.1):
+    def __init__(self, graph, evaporation_rate=0.15, min_pheromone=0.1, initial_pheromone=0.5):
         self.graph = graph
         self.evaporation_rate = evaporation_rate
         self.min_pheromone = min_pheromone
+        self.initial_pheromone = initial_pheromone
+        
+        # Initialize pheromones to a lower value to make changes more noticeable
+        for u, v in self.graph.edges():
+            self.graph[u][v]['pheromone'] = initial_pheromone
     
     def update_pheromones(self, paths):
         """
@@ -35,7 +40,8 @@ class PheromoneManager:
         for path, path_quality in paths:
             # Only reinforce good paths
             if path_quality > 0:
-                pheromone_deposit = path_quality
+                # Scale up the pheromone deposit (multiply by 10 to make changes more visible)
+                pheromone_deposit = path_quality * 10
                 
                 # Deposit on each edge in the path
                 for i in range(len(path) - 1):

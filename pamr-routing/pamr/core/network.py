@@ -74,8 +74,12 @@ class NetworkTopology:
             G[u][v]['base_distance'] = distance
             G[u][v]['base_capacity'] = capacity
     
-    def update_dynamic_metrics(self):
-        """Update network metrics with small variations to simulate dynamic conditions."""
+    def update_dynamic_metrics(self, traffic_decay=0.7):
+        """Update network metrics with small variations to simulate dynamic conditions.
+        
+        Args:
+            traffic_decay: Factor that determines how much traffic decays each iteration (0.7 = 30% decay)
+        """
         # Increment iteration counter
         self.iteration += 1
         
@@ -96,11 +100,14 @@ class NetworkTopology:
             variation = (time_factor + noise) * self.graph[u][v]['base_capacity']
             self.graph[u][v]['capacity'] = max(10.0, self.graph[u][v]['base_capacity'] + variation)
             
-            # Simulate traffic changes - small random adjustments
-            traffic_change = np.random.normal(0, self.variation_factor * 10)
+            # Apply traffic decay - simulate traffic clearing from the network (30% decay)
+            self.graph[u][v]['traffic'] *= traffic_decay
+            
+            # Simulate traffic changes - small random adjustments 
+            traffic_change = np.random.normal(0, self.variation_factor * 8)  # Reduced random traffic
             self.graph[u][v]['traffic'] = max(0.0, min(
                 self.graph[u][v]['traffic'] + traffic_change,
-                self.graph[u][v]['capacity'] * 0.9  # Cap at 90% of capacity
+                self.graph[u][v]['capacity'] * 0.8  # Cap at 80% of capacity instead of 90%
             ))
             
             # Update congestion based on traffic/capacity ratio
@@ -137,7 +144,7 @@ class NetworkTopology:
         return network
     
     @classmethod
-    def get_consistent_network(cls, filepath="network_state.pkl", force_new=False, **kwargs):
+    def get_consistent_network(cls, filepath="consistent_network.pkl", force_new=False, **kwargs):
         """Get a consistent network for use across simulation files.
         
         Args:
@@ -156,12 +163,22 @@ class NetworkTopology:
             network.save(filepath)
             return network
 
-# Create a consistent network across all examples - FORCE REGENERATION
-network = NetworkTopology.get_consistent_network(
+# Default configuration for the consistent network
+DEFAULT_NUM_NODES = 90
+DEFAULT_CONNECTIVITY = 0.9
+DEFAULT_SEED = 42
+DEFAULT_VARIATION_FACTOR = 0.15
+
+# Create a consistent network across all examples
+# This instance will be imported by other modules
+consistent_network = NetworkTopology.get_consistent_network(
     filepath="consistent_network.pkl",
     force_new=True,  # Force creation of new network with current parameters
-    num_nodes=14,   # Your desired node count
-    connectivity=0.2,  # Your desired connectivity
-    seed=10,
-    variation_factor=0.05
+    num_nodes=DEFAULT_NUM_NODES,
+    connectivity=DEFAULT_CONNECTIVITY,
+    seed=DEFAULT_SEED,
+    variation_factor=DEFAULT_VARIATION_FACTOR
 )
+
+# For backward compatibility
+network = consistent_network

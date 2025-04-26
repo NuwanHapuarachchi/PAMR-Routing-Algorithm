@@ -310,6 +310,8 @@ class PyVizNetworkVisualizer:
                     metrics[f'path_{source}_to_{dest}_length'] = path_metrics['length']
                     metrics[f'path_{source}_to_{dest}_congestion'] = path_metrics['max_congestion']
                     metrics[f'path_{source}_to_{dest}_hops'] = len(path) - 1
+                    # Store the actual path
+                    metrics[f'path_{source}_to_{dest}'] = ' → '.join(str(n) for n in path)
         
         # Add iteration metrics to history
         self.iteration_metrics.append(metrics)
@@ -453,8 +455,27 @@ class PyVizNetworkVisualizer:
         # Prepare comparison data
         comparison_data = []
         
+        # First add the paths
+        path_cols = [col for col in metrics_df.columns if col.startswith('path_') and not col.endswith(('_quality', '_length', '_congestion', '_hops'))]
+        for col in path_cols:
+            metric_name = col.replace('_', ' ').title()
+            # For paths, we need to handle string values
+            first_val = first_iteration.get(col, "")
+            middle_val = middle_iteration.get(col, "")
+            last_val = last_iteration.get(col, "")
+            
+            comparison_data.append({
+                'Metric': metric_name,
+                'First Iteration': first_val,
+                'Middle Iteration': middle_val,
+                'Last Iteration': last_val,
+                'Mid-point Change %': 'N/A',
+                'Overall Change %': 'N/A'
+            })
+        
+        # Then add numeric metrics
         for col in metrics_df.columns:
-            if col not in ['iteration', 'timestamp'] and metrics_df[col].dtype != 'object':
+            if col not in ['iteration', 'timestamp'] and col not in path_cols and metrics_df[col].dtype != 'object':
                 metric_name = col.replace('_', ' ').title()
                 first_val = first_iteration[col]
                 middle_val = middle_iteration[col]
@@ -491,6 +512,7 @@ class PyVizNetworkVisualizer:
             Panel dashboard object and path to saved HTML file (if output_dir provided)
         """
         import time
+        import os
         
         # Network visualization
         network_viz = self.visualize_network(source, destinations, paths)
@@ -520,9 +542,27 @@ class PyVizNetworkVisualizer:
             dashboard.append(pn.pane.Markdown("## Path Quality Comparison"))
             dashboard.append(path_comparison)
         
+        # Include static visualization images if they exist
+        if output_dir and os.path.exists(output_dir):
+            dashboard.append(pn.pane.Markdown("## Static Visualizations"))
+            
+            # Check for and add each visualization image
+            image_files = {
+                "Path Quality Comparison": "path_quality_comparison.png",
+                "Congestion Comparison": "congestion_comparison.png",
+                "Pheromone Levels": "pheromone_comparison.png",
+                "Metrics Correlation": "metrics_correlation.png",
+                "Metrics Summary Table": "metrics_table.png"
+            }
+            
+            for title, filename in image_files.items():
+                file_path = os.path.join(output_dir, filename)
+                if os.path.exists(file_path):
+                    dashboard.append(pn.pane.Markdown(f"### {title}"))
+                    dashboard.append(pn.pane.PNG(file_path, width=1000))
+        
         # Save to HTML if output directory is provided
         if output_dir:
-            import os
             os.makedirs(output_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             filename = f"pamr_metrics_report_{timestamp}.html"

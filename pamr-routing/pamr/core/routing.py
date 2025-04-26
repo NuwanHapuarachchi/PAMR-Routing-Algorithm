@@ -5,12 +5,15 @@ import networkx as nx
 class PAMRRouter:
     """Path selection and routing logic for PAMR protocol."""
     
-    def __init__(self, graph, alpha=2.0, beta=3.0, gamma=2.5):
+    def __init__(self, graph, alpha=2.0, beta=3.0, gamma=6.0, adapt_weights=True):
         self.graph = graph
-        self.alpha = alpha  # Pheromone importance
+        self.alpha = alpha  # Pheromone importance - reduced to prevent over-commitment to established paths
         self.beta = beta    # Distance importance
-        self.gamma = gamma  # Congestion importance
+        self.gamma = gamma  # Congestion importance - increased for better congestion avoidance
         self.use_global_path = True  # Enable global path consideration
+        self.adapt_weights = adapt_weights  # Dynamically adapt weights based on network conditions
+        self.path_history = {}  # Track routing history for source-destination pairs
+        self.iteration = 0  # Track iterations for adaptive weight adjustment
     
     def find_path(self, source, destination, max_steps=100):
         """Find a path from source to destination using PAMR."""
@@ -67,11 +70,19 @@ class PAMRRouter:
                 distance = edge_data['distance'] 
                 congestion = edge_data['congestion']
                 
-                # Similar to OSPF, give congestion a higher weight
-                congestion_factor = 1 + congestion * 5
+                # Adaptive congestion factor - exponential penalty for high congestion
+                congestion_factor = 1 + (congestion ** 3) * 12  # Stronger exponential penalty
                 
                 # Include pheromone in inverse proportion (higher pheromone = lower weight)
                 pheromone_factor = 1 / (pheromone + 0.1)  # Add 0.1 to avoid division by zero
+                
+                # Adaptive weighting based on network conditions
+                if self.adapt_weights and (source, destination) in self.path_history:
+                    # If this source-destination pair has been routed before, check if quality is degrading
+                    history = self.path_history[(source, destination)]
+                    if len(history) >= 2 and history[-1]['quality'] < history[-2]['quality'] * 0.8:
+                        # Quality degrading - increase weight of congestion even more
+                        congestion_factor *= 2.0
                 
                 # Combined weight - lower is better
                 return distance * congestion_factor * pheromone_factor
@@ -103,10 +114,10 @@ class PAMRRouter:
             distance = self.graph[current_node][neighbor]['distance']
             congestion = self.graph[current_node][neighbor]['congestion']
             
-            # Calculate desirability
+            # Calculate desirability with more emphasis on avoiding congested links
             pheromone_factor = pheromone ** self.alpha
             distance_factor = (1.0 / distance) ** self.beta
-            congestion_factor = (1.0 - congestion) ** self.gamma
+            congestion_factor = (1.0 - congestion) ** self.gamma  # Increased gamma makes this more sensitive
             
             # Combined desirability
             desirability = pheromone_factor * distance_factor * congestion_factor
@@ -124,19 +135,57 @@ class PAMRRouter:
             
         probabilities = [p / total for p in probabilities]
 
-        # Select neighbor based on probability
-        selected_idx = np.argmax(probabilities)  # Choose highest probability always
+        # Introduce more exploration to avoid getting stuck on same paths
+        # Probabilistic selection with higher probability for better paths
+        # but significantly more chance to explore alternatives
+        if random.random() < 0.75:  # 75% of the time choose highest probability (was 85%)
+            selected_idx = np.argmax(probabilities)
+        else:
+            # 25% of the time do weighted random selection for more exploration
+            selected_idx = np.random.choice(range(len(valid_neighbors)), p=probabilities)
+            
         return valid_neighbors[selected_idx]
     
     def _calculate_path_quality(self, path):
         """Calculate the quality of a path."""
         total_distance = 0
         max_congestion = 0
+        avg_congestion = 0
+        congestion_values = []
+        
         for i in range(len(path) - 1):
             u, v = path[i], path[i+1]
             total_distance += self.graph[u][v]['distance']
+            congestion_values.append(self.graph[u][v]['congestion'])
             max_congestion = max(max_congestion, self.graph[u][v]['congestion'])
         
-        # Path quality metric - lower distance and congestion = higher quality
-        path_quality = 1.0 / (total_distance * (1 + max_congestion))
+        # Calculate average congestion as well
+        avg_congestion = sum(congestion_values) / len(congestion_values) if congestion_values else 0
+        
+        # Improved path quality metric - balances distance and congestion impact
+        # Congestion impact now scales more gradually
+        congestion_impact = 1 + (max_congestion * 0.6 + avg_congestion * 0.4)
+        path_quality = 1.0 / (total_distance * congestion_impact)
+        
+        # Store path history for adaptive routing
+        path_key = (path[0], path[-1])
+        if path_key not in self.path_history:
+            self.path_history[path_key] = []
+        
+        # Add this result to path history
+        self.path_history[path_key].append({
+            'iteration': self.iteration,
+            'quality': path_quality,
+            'congestion': max_congestion,
+            'path': path.copy()  # Store the actual path to track changes
+        })
+        
+        # Limit history size
+        if len(self.path_history[path_key]) > 5:
+            self.path_history[path_key].pop(0)
+            
         return path_quality
+        
+    def update_iteration(self):
+        """Update the iteration counter for the router."""
+        self.iteration += 1
