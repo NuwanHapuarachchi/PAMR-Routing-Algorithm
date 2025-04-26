@@ -1,18 +1,35 @@
 import networkx as nx
 import random
+import numpy as np
+import pickle
+import os
 
 class NetworkTopology:
-    """Network topology management for PAMR routing."""
+    """Network topology management for PAMR routing with dynamic metrics."""
     
-    def __init__(self, num_nodes=15, connectivity=0.3, seed=42):
+    def __init__(self, num_nodes=30, connectivity=0.3, seed=42, variation_factor=0.05):
+        """Initialize network topology.
+        
+        Args:
+            num_nodes: Number of nodes in the network
+            connectivity: Probability of edge creation between nodes
+            seed: Random seed for reproducibility
+            variation_factor: Factor controlling the magnitude of dynamic variations (0.05 = 5%)
+        """
         self.num_nodes = num_nodes
         self.connectivity = connectivity
         self.seed = seed
+        self.variation_factor = variation_factor
+        self.iteration = 0
         self.graph = self._create_network()
         self.positions = nx.spring_layout(self.graph, seed=self.seed)
-    
+        
     def _create_network(self):
         """Create a random network with given parameters."""
+        # Set random seed for reproducibility
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        
         # Use Erdos-Renyi random graph model
         G = nx.erdos_renyi_graph(self.num_nodes, self.connectivity, directed=True, seed=self.seed)
         
@@ -38,13 +55,113 @@ class NetworkTopology:
     def _initialize_edge_attributes(self, G, pheromone_init=1.0):
         """Initialize edge attributes for the network."""
         for u, v in G.edges():
-            # Set random distance/cost
-            distance = random.uniform(1, 10)
-            # Capacity (bandwidth) in arbitrary units
-            capacity = random.uniform(10, 100)
+            # Set consistent initial values based on node indices
+            # This ensures reproducibility while still having variety
+            edge_seed = u * self.num_nodes + v
+            rng = random.Random(edge_seed + self.seed)
+            
+            # Set random distance/cost (1-10)
+            distance = rng.uniform(1, 10)
+            # Capacity (bandwidth) in arbitrary units (10-100)
+            capacity = rng.uniform(10, 100)
             
             G[u][v]['distance'] = distance
             G[u][v]['pheromone'] = pheromone_init
             G[u][v]['capacity'] = capacity
-            G[u][v]['traffic'] = 0
+            G[u][v]['traffic'] = 0.0
             G[u][v]['congestion'] = 0.0
+            # Store original values for controlled variations
+            G[u][v]['base_distance'] = distance
+            G[u][v]['base_capacity'] = capacity
+    
+    def update_dynamic_metrics(self):
+        """Update network metrics with small variations to simulate dynamic conditions."""
+        # Increment iteration counter
+        self.iteration += 1
+        
+        # Set seed based on iteration for controlled randomness
+        np.random.seed(self.seed + self.iteration)
+        
+        for u, v in self.graph.edges():
+            # Generate small variations around the base values
+            # Using a sine wave pattern with small random noise for smooth variations
+            time_factor = np.sin(self.iteration / 10) * self.variation_factor
+            noise = np.random.normal(0, self.variation_factor/3)
+            
+            # Update distance (small variations around base)
+            variation = (time_factor + noise) * self.graph[u][v]['base_distance']
+            self.graph[u][v]['distance'] = max(1.0, self.graph[u][v]['base_distance'] + variation)
+            
+            # Update capacity (small variations around base)
+            variation = (time_factor + noise) * self.graph[u][v]['base_capacity']
+            self.graph[u][v]['capacity'] = max(10.0, self.graph[u][v]['base_capacity'] + variation)
+            
+            # Simulate traffic changes - small random adjustments
+            traffic_change = np.random.normal(0, self.variation_factor * 10)
+            self.graph[u][v]['traffic'] = max(0.0, min(
+                self.graph[u][v]['traffic'] + traffic_change,
+                self.graph[u][v]['capacity'] * 0.9  # Cap at 90% of capacity
+            ))
+            
+            # Update congestion based on traffic/capacity ratio
+            self.graph[u][v]['congestion'] = min(0.95, self.graph[u][v]['traffic'] / self.graph[u][v]['capacity'])
+    
+    def save(self, filepath="network_state.pkl"):
+        """Save the current network state to a file for reuse across simulations."""
+        with open(filepath, 'wb') as f:
+            pickle.dump({
+                'num_nodes': self.num_nodes,
+                'connectivity': self.connectivity,
+                'seed': self.seed,
+                'variation_factor': self.variation_factor,
+                'iteration': self.iteration,
+                'graph': self.graph
+            }, f)
+        return filepath
+    
+    @classmethod
+    def load(cls, filepath="network_state.pkl"):
+        """Load a network state from file."""
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+        
+        network = cls(
+            num_nodes=data['num_nodes'],
+            connectivity=data['connectivity'],
+            seed=data['seed'],
+            variation_factor=data['variation_factor']
+        )
+        network.iteration = data['iteration']
+        network.graph = data['graph']
+        network.positions = nx.spring_layout(network.graph, seed=network.seed)
+        return network
+    
+    @classmethod
+    def get_consistent_network(cls, filepath="network_state.pkl", force_new=False, **kwargs):
+        """Get a consistent network for use across simulation files.
+        
+        Args:
+            filepath: Path to save/load the network state
+            force_new: If True, creates a new network even if file exists
+            **kwargs: Parameters for network creation
+        
+        Returns:
+            NetworkTopology instance
+        """
+        if os.path.exists(filepath) and not force_new:
+            return cls.load(filepath)
+        else:
+            # If file doesn't exist or force_new is True, create new network
+            network = cls(**kwargs)
+            network.save(filepath)
+            return network
+
+# Create a consistent network across all examples - FORCE REGENERATION
+network = NetworkTopology.get_consistent_network(
+    filepath="consistent_network.pkl",
+    force_new=True,  # Force creation of new network with current parameters
+    num_nodes=14,   # Your desired node count
+    connectivity=0.2,  # Your desired connectivity
+    seed=10,
+    variation_factor=0.05
+)

@@ -22,11 +22,11 @@ from pamr.visualization.pyviz_network import PyVizNetworkVisualizer
 from pamr.visualization.metrics_viz import NetworkMetricsVisualizer
 
 def main():
-    # Create network topology
-    network = NetworkTopology(num_nodes=15, connectivity=0.3)
-    
-    # Create router
-    router = PAMRRouter(network.graph, alpha=1.0, beta=2.0, gamma=1.0)
+    # Always import the central network definition
+    from pamr.core.network import network
+
+    # Create router with optimized parameters
+    router = PAMRRouter(network.graph, alpha=2.0, beta=3.0, gamma=2.5)
     
     # Create simulator
     simulator = PAMRSimulator(network, router)
@@ -101,35 +101,63 @@ def main():
         # Convert to pandas DataFrame
         node_df = pd.DataFrame.from_dict(node_metrics, orient='index')
         
-        # Extract path metrics from the simulation
+        # Extract path metrics from the simulation - FIX HERE
         path_metrics = []
         for iter_idx, iter_paths in enumerate(path_history):
-            for path, quality in iter_paths:
-                if path and len(path) > 1:  # Ensure the path isn't empty
-                    src, dest = path[0], path[-1]
+            for item in iter_paths:
+                # Try to extract path and quality based on common formats
+                path = None
+                quality = None
+                src = None
+                dest = None
+                
+                # Handle different formats of data in iter_paths
+                if isinstance(item, tuple) or isinstance(item, list):
+                    if len(item) == 2:
+                        # Format is (path, quality)
+                        path, quality = item
+                    elif len(item) == 4:
+                        # Format is (source, destination, path, quality)
+                        src, dest, path, quality = item
+                    elif len(item) == 3:
+                        # Format is (source, destination, path)
+                        src, dest, path = item
+                        quality = 0  # Default quality
+                else:
+                    continue
+                
+                # If path wasn't extracted or is empty, skip this item
+                if not path or len(path) < 2:
+                    continue
                     
-                    # Calculate path metrics
-                    total_distance = 0
-                    total_pheromone = 0
-                    max_congestion = 0
-                    
-                    for i in range(len(path) - 1):
-                        u, v = path[i], path[i+1]
-                        total_distance += network.graph[u][v]['distance']
-                        total_pheromone += network.graph[u][v]['pheromone']
-                        max_congestion = max(max_congestion, network.graph[u][v]['congestion'])
-                    
-                    path_metrics.append({
-                        'source': src,
-                        'destination': dest,
-                        'iteration': iter_idx,
-                        'path_length': len(path),
-                        'path_quality': quality,
-                        'total_distance': total_distance,
-                        'avg_pheromone': total_pheromone / (len(path) - 1),
-                        'max_congestion': max_congestion,
-                        'path': '->'.join(map(str, path))
-                    })
+                # If source/destination weren't extracted, get them from the path
+                if src is None:
+                    src = path[0]
+                if dest is None:
+                    dest = path[-1]
+                
+                # Calculate path metrics
+                total_distance = 0
+                total_pheromone = 0
+                max_congestion = 0
+                
+                for i in range(len(path) - 1):
+                    u, v = path[i], path[i+1]
+                    total_distance += network.graph[u][v]['distance']
+                    total_pheromone += network.graph[u][v]['pheromone']
+                    max_congestion = max(max_congestion, network.graph[u][v]['congestion'])
+                
+                path_metrics.append({
+                    'source': src,
+                    'destination': dest,
+                    'iteration': iter_idx,
+                    'path_length': len(path),
+                    'path_quality': quality,
+                    'total_distance': total_distance,
+                    'avg_pheromone': total_pheromone / (len(path) - 1),
+                    'max_congestion': max_congestion,
+                    'path': '->'.join(map(str, path))
+                })
         
         # Convert to pandas DataFrame
         path_df = pd.DataFrame(path_metrics) if path_metrics else pd.DataFrame()

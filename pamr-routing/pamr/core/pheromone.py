@@ -1,7 +1,7 @@
 class PheromoneManager:
     """Manages pheromone operations for PAMR routing."""
     
-    def __init__(self, graph, evaporation_rate=0.1, min_pheromone=0.1):
+    def __init__(self, graph, evaporation_rate=0.15, min_pheromone=0.1):
         self.graph = graph
         self.evaporation_rate = evaporation_rate
         self.min_pheromone = min_pheromone
