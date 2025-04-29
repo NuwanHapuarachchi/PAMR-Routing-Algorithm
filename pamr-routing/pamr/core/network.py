@@ -163,22 +163,37 @@ class NetworkTopology:
             network.save(filepath)
             return network
 
-# Default configuration for the consistent network
-DEFAULT_NUM_NODES = 90
-DEFAULT_CONNECTIVITY = 0.9
-DEFAULT_SEED = 42
-DEFAULT_VARIATION_FACTOR = 0.15
+# Debugging: Add print statements to confirm function execution
+print("Debug: Starting to print metrics for nodes 0 and 1")
 
-# Create a consistent network across all examples
-# This instance will be imported by other modules
+# Function to print metrics for specific source and destination nodes
+def print_metrics_for_nodes(network, source, destination, iterations=20):
+    print(f"Debug: Metrics for source node {source} and destination node {destination}:")
+    print("Iteration | Edge (u, v) | Distance | Capacity | Traffic | Congestion")
+    print("-" * 70)
+    for i in range(iterations):
+        print(f"Debug: Iteration {i+1}")  # Debugging iteration
+        network.update_dynamic_metrics()
+        for u, v in network.graph.edges():
+            if u == source and v == destination:
+                distance = network.graph[u][v]['distance']
+                capacity = network.graph[u][v]['capacity']
+                traffic = network.graph[u][v]['traffic']
+                congestion = network.graph[u][v]['congestion']
+                print(f"{i+1:9} | ({u:2}, {v:2}) | {distance:8.2f} | {capacity:8.2f} | {traffic:7.2f} | {congestion:9.2f}")
+
+# Initialize consistent_network before using it
 consistent_network = NetworkTopology.get_consistent_network(
     filepath="consistent_network.pkl",
-    force_new=True,  # Force creation of new network with current parameters
-    num_nodes=DEFAULT_NUM_NODES,
-    connectivity=DEFAULT_CONNECTIVITY,
-    seed=DEFAULT_SEED,
-    variation_factor=DEFAULT_VARIATION_FACTOR
+    force_new=True,  # Use existing network if available
+    num_nodes=10,  # Default number of nodes
+    connectivity=0.02,  # Default connectivity
+    seed=42,  # Default seed for reproducibility
+    variation_factor=0.5  # Default variation factor
 )
+
+# Example usage for nodes 0 and 1
+print_metrics_for_nodes(consistent_network, source=0, destination=1)
 
 # For backward compatibility
 network = consistent_network

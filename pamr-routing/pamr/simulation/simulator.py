@@ -74,14 +74,7 @@ class PAMRSimulator:
                 
                 if path and len(path) > 1:
                     # Update edge traffic and congestion based on path
-                    for i in range(len(path) - 1):
-                        u, v = path[i], path[i+1]
-                        self.network.graph[u][v]['traffic'] += 1.0
-                        self.network.graph[u][v]['congestion'] = min(
-                            0.95, 
-                            self.network.graph[u][v]['traffic'] / self.network.graph[u][v]['capacity']
-                        )
-                        max_congestion = max(max_congestion, self.network.graph[u][v]['congestion'])
+                    self._update_network_congestion(path)
                     
                     # Store path information
                     iteration_paths.append((source, destination, path, quality))
@@ -102,3 +95,22 @@ class PAMRSimulator:
         
         # Return collected path history for analysis
         return path_history
+    
+    def _update_network_congestion(self, path):
+        """Update network congestion based on a routed path."""
+        if not path or len(path) < 2:
+            return
+            
+        # Update traffic and recalculate congestion for each link in the path
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            
+            # Get current traffic and capacity values
+            current_traffic = self.network.graph[u][v].get('traffic', 0)
+            capacity = self.network.graph[u][v].get('capacity', 10)
+            
+            # Increment traffic (standard packet size of 1.0)
+            self.network.graph[u][v]['traffic'] = current_traffic + 1.0
+            
+            # Calculate congestion as traffic / capacity ratio (without arbitrary cap)
+            self.network.graph[u][v]['congestion'] = self.network.graph[u][v]['traffic'] / capacity

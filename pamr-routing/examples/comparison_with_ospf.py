@@ -51,11 +51,12 @@ class OSPFRouter:
             self.routing_tables[source] = shortest_paths
     
     def _ospf_link_cost(self, u, v, edge_data):
-        """Calculate OSPF link cost based on distance and congestion."""
-        # Standard OSPF cost is 100/bandwidth, but we'll use distance and congestion
-        base_cost = edge_data['distance']
-        congestion_factor = 1 + edge_data['congestion'] * 5  # Congestion has higher impact in OSPF
-        return base_cost * congestion_factor
+        """Calculate OSPF link cost based on real OSPF metrics."""
+        # Real OSPF cost is inversely proportional to bandwidth
+        reference_bandwidth = 100000  # Reference bandwidth in Mbps (configurable)
+        link_bandwidth = edge_data.get('bandwidth', 1)  # Bandwidth in Mbps (default to 1 Mbps if not specified)
+        cost = reference_bandwidth / link_bandwidth
+        return cost
     
     def find_path(self, source, destination):
         """Find the path from source to destination using OSPF routing."""
@@ -188,11 +189,15 @@ def run_comparison(num_nodes=25, connectivity=0.3, num_iterations=150, packets_p
     
     # Create a new NetworkTopology with the same parameters but use the cloned graph
     from pamr.core.network import NetworkTopology
+    
+    # Create a reference instance with default values to extract the parameters
+    default_network = NetworkTopology()
+    
     network_ospf = NetworkTopology(
         num_nodes=network.num_nodes,
         connectivity=network.connectivity,
-        seed=network.seed,
-        variation_factor=network.variation_factor
+        seed=default_network.seed,
+        variation_factor=default_network.variation_factor
     )
     network_ospf.graph = network_ospf_graph
     network_ospf.positions = network_pamr.positions.copy()
@@ -275,14 +280,77 @@ def visualize_comparison(comparison_results, output_dir):
     
     # Create visualizations
     
+    # 0. Visualize the pure network topology (no congestion coloring)
+    from pamr.core.network import network
+    plt.figure(figsize=(12, 10))
+    
+    # Get positions for the graph
+    pos = network.positions
+    
+    # Draw basic network with no attribute-based coloring
+    # Draw edges with a single neutral color to show bidirectional/duplex connections
+    for u, v in network.graph.edges():
+        # Draw first direction (u to v)
+        nx.draw_networkx_edges(
+            network.graph, 
+            pos=pos,
+            edgelist=[(u, v)],
+            edge_color='gray',
+            width=2.5,  # Increased line width for better visibility
+            alpha=0.7,
+            arrows=True,
+            arrowstyle='-|>',
+            arrowsize=10
+        )
+        
+        # Draw second direction (v to u) to show duplex connection
+        nx.draw_networkx_edges(
+            network.graph, 
+            pos=pos,
+            edgelist=[(v, u)],
+            edge_color='gray',
+            width=2.5,  # Increased line width for better visibility
+            alpha=0.7,
+            arrows=True,
+            arrowstyle='-|>',
+            arrowsize=10
+        )
+    
+    # Draw nodes with a single color
+    nx.draw_networkx_nodes(
+        network.graph, 
+        pos=pos,
+        node_color='lightblue',
+        node_size=120  # Slightly larger nodes
+    )
+    
+    # Add node labels (numbers)
+    nx.draw_networkx_labels(
+        network.graph,
+        pos=pos,
+        font_size=9,
+        font_weight='bold'
+    )
+    
+    # Remove axes, title, and borders for a cleaner image
+    plt.axis('off')
+    plt.tight_layout(pad=0)
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    
+    # Save with high resolution
+    topology_path = os.path.join(output_dir, 'network_topology_ospf_comparison.png')
+    plt.savefig(topology_path, bbox_inches='tight', dpi=300, transparent=True)
+    plt.close()
+    
     # 1. Convergence time comparison
     plt.figure(figsize=(10, 6))
-    plt.plot(pamr_metrics['convergence_times'], label='PAMR')
-    plt.plot(ospf_metrics['convergence_times'], label='OSPF')
+    # Ensure all plotted elements have labels for the legend
+    plt.plot(pamr_metrics['convergence_times'], label='PAMR Convergence Time')
+    plt.plot(ospf_metrics['convergence_times'], label='OSPF Convergence Time')
+    plt.legend()  # This will now include the labeled lines
     plt.title('Convergence Time Comparison')
     plt.xlabel('Iteration')
     plt.ylabel('Convergence Time (s)')
-    plt.legend()
     plt.grid(True)
     convergence_path = os.path.join(output_dir, 'convergence_time_comparison.png')
     plt.savefig(convergence_path)
@@ -303,13 +371,23 @@ def visualize_comparison(comparison_results, output_dir):
     
     # 3. Traffic distribution comparison
     plt.figure(figsize=(10, 6))
-    plt.plot(pamr_metrics['congestion_levels'], label='PAMR')
-    plt.plot(ospf_metrics['congestion_levels'], label='OSPF')
-    plt.title('Traffic Distribution Comparison')
+    
+    # Set a better y-axis scale to show congestion variation
+    plt.plot(pamr_metrics['congestion_levels'], label='PAMR Max Congestion')
+    plt.plot(ospf_metrics['congestion_levels'], label='OSPF Max Congestion')
+    plt.title('Traffic Distribution - Maximum Congestion Levels')
     plt.xlabel('Iteration')
     plt.ylabel('Maximum Congestion Level')
-    plt.legend()
+    
+    # Adjust the y-axis scale to better visualize congestion values
+    plt.ylim(0, 1.0)  # Set y-axis from 0 to 1
+    
+    # Add grid and add a reference line at 0.5 congestion
     plt.grid(True)
+    plt.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7)
+    
+    plt.legend()
+    
     traffic_path = os.path.join(output_dir, 'traffic_distribution_comparison.png')
     plt.savefig(traffic_path)
     plt.close()
@@ -349,17 +427,27 @@ def visualize_comparison(comparison_results, output_dir):
         ospf_path = data['ospf_path']
         ospf_path_edges = [(ospf_path[i], ospf_path[i+1]) for i in range(len(ospf_path)-1)]
         
+        # Create legend handles manually to ensure they appear
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='blue', lw=2, label=f"PAMR (Quality: {data['pamr_quality']:.3f})"),
+            Line2D([0], [0], color='orange', lw=2, label=f"OSPF (Quality: {data['ospf_quality']:.3f})"),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, label='Source'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='Destination')
+        ]
+        
         # Draw PAMR path edges
         nx.draw_networkx_edges(g, pos, edgelist=pamr_path_edges, width=2.0, 
-                              edge_color='blue', label=f"PAMR (Quality: {data['pamr_quality']:.3f})")
+                              edge_color='blue')
         
         # Draw OSPF path edges
         nx.draw_networkx_edges(g, pos, edgelist=ospf_path_edges, width=2.0, 
-                              edge_color='orange', label=f"OSPF (Quality: {data['ospf_quality']:.3f})")
+                              edge_color='orange')
         
         plt.title(f"Path Comparison (Source: {src}, Destination: {dst})")
-        plt.legend()
-        plt.axis('off')
+        
+        # Add the legend with our custom handles
+        plt.legend(handles=legend_elements, loc="upper right")
         
         path_viz_file = os.path.join(output_dir, f"ospf_vs_pamr_ml_path_{src}_to_{dst}.png")
         plt.savefig(path_viz_file, bbox_inches='tight')
@@ -400,6 +488,12 @@ def visualize_comparison(comparison_results, output_dir):
                 <tr><td>Number of Iterations</td><td>{params['num_iterations']}</td></tr>
                 <tr><td>Packets per Iteration</td><td>{params['packets_per_iter']}</td></tr>
             </table>
+            
+            <div class="comparison-section">
+                <h2>Network Topology</h2>
+                <p>The following image shows the pure network topology used in this simulation.</p>
+                <img src="network_topology_ospf_comparison.png" alt="Network Topology">
+            </div>
             
             <div class="comparison-section">
                 <h2>Overall Performance Metrics</h2>

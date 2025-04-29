@@ -1,0 +1,117 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\title{Mathematical Formulations in PAMR Routing}
+\author{PAMR Project}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+This document provides a comprehensive collection of the mathematical equations used in the Pheromone-based Adaptive Multi-path Routing (PAMR) project and its comparisons with traditional routing protocols like OSPF and RIP.
+
+\section{PAMR Core Routing Equations}
+
+\subsection{Path Quality Calculation}
+The comprehensive path quality calculation in PAMR considers multiple factors with weighted contributions:
+
+\begin{align}
+\text{delay\_quality} &= \frac{10.0}{\text{total\_delay} + 1.0} \\
+\text{congestion\_impact} &= 0.5 \times \text{avg\_congestion} + 0.5 \times \text{max\_congestion} \\
+\text{congestion\_quality} &= \frac{1.0}{1.0 + \text{congestion\_impact} \times 3.0} \\
+\text{bandwidth\_quality} &= \frac{\text{min\_bandwidth}}{10.0} \\
+\text{hop\_quality} &= \frac{1.0}{1.0 + \text{hop\_count} \times 0.1} \\
+\text{final\_quality} &= \text{delay\_quality} \times 0.4 + \text{congestion\_quality} \times 0.3 + \text{bandwidth\_quality} \times 0.2 + \text{hop\_quality} \times 0.1
+\end{align}
+
+\subsection{Congestion-Induced Delay}
+PAMR calculates how congestion affects delay using the following equation:
+\begin{align}
+\text{congestion\_delay} = \text{distance} \times (1 + \text{congestion}^2 \times 5)
+\end{align}
+
+\subsection{Edge Weight Calculation for Path Finding}
+The core path finding algorithm uses edge weights based on:
+\begin{align}
+\text{congestion\_factor} &= 1 + \text{congestion}^2 \times 10 \\
+\text{pheromone\_factor} &= \frac{1}{\text{pheromone} + 0.1} \\
+\text{edge\_weight} &= \text{edge\_distance} \times \text{congestion\_factor} \times \text{pheromone\_factor} \times 0.1
+\end{align}
+
+\subsection{Alternative Path Weight Functions}
+For finding alternative paths with higher congestion penalty:
+\begin{align}
+\text{congestion\_factor} &= 1 + \text{congestion}^3 \times 15 \\
+\text{weight} &= \text{distance} \times \text{congestion\_factor}
+\end{align}
+
+For finding paths that prioritize low congestion:
+\begin{align}
+\text{congestion\_factor} &= (1 + \text{congestion} \times 10)^4 \\
+\text{weight} &= \text{distance} \times \text{congestion\_factor}
+\end{align}
+
+\subsection{Node Selection Probability Components}
+\begin{align}
+\text{pheromone\_factor} &= \text{pheromone}^{\alpha} \\
+\text{distance\_factor} &= \left(\frac{1.0}{\text{distance}}\right)^{\beta}
+\end{align}
+
+\subsection{Progressive Congestion Avoidance}
+PAMR implements a tiered sensitivity to congestion levels:
+\begin{align}
+\text{congestion\_factor} = 
+\begin{cases}
+(1.0 - \text{predicted\_congestion})^{\gamma} & \text{if } \text{predicted\_congestion} < 0.3 \\
+(1.0 - \text{predicted\_congestion})^{\gamma \times 2} & \text{if } \text{predicted\_congestion} < 0.6 \\
+(1.0 - \text{predicted\_congestion})^{\gamma \times 3} & \text{otherwise}
+\end{cases}
+\end{align}
+
+\subsection{Combined Desirability for Node Selection}
+\begin{align}
+\text{desirability} = \text{pheromone\_factor} \times \text{distance\_factor} \times \text{congestion\_factor} \times \text{bandwidth\_factor} \times \text{heuristic\_factor}
+\end{align}
+
+\section{OSPF Routing Equations}
+
+\subsection{OSPF Link Cost}
+\begin{align}
+\text{cost} = \frac{\text{reference\_bandwidth}}{\text{link\_bandwidth}}
+\end{align}
+where reference\_bandwidth is typically 100,000 Mbps.
+
+\subsection{Path Quality Equation (OSPF)}
+\begin{align}
+\text{path\_quality} = \frac{1.0}{\text{total\_distance} \times (1 + \text{max\_congestion})}
+\end{align}
+
+\section{RIP Routing Equations}
+
+\subsection{RIP Metric Calculation}
+\begin{align}
+\text{metric} = \min(15, \max(1, \text{int}(\text{reference\_bandwidth} / \text{bandwidth})))
+\end{align}
+where reference\_bandwidth is typically 10 Mbps for RIPv2.
+
+\subsection{Path Quality Equation (RIP)}
+For fair comparison with PAMR, the same quality metric is used:
+\begin{align}
+\text{path\_quality} = \frac{1.0}{\text{total\_distance} \times (1 + \text{max\_congestion})}
+\end{align}
+
+\section{Common Network Metrics}
+
+\subsection{Congestion Calculation}
+\begin{align}
+\text{congestion} = \min(0.95, \text{traffic} / \text{capacity})
+\end{align}
+
+\end{document}
