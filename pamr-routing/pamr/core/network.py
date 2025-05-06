@@ -186,8 +186,8 @@ def print_metrics_for_nodes(network, source, destination, iterations=20):
 consistent_network = NetworkTopology.get_consistent_network(
     filepath="consistent_network.pkl",
     force_new=True,  # Use existing network if available
-    num_nodes=10,  # Default number of nodes
-    connectivity=0.02,  # Default connectivity
+    num_nodes=15,  # Default number of nodes
+    connectivity=0.3,  # Default connectivity
     seed=42,  # Default seed for reproducibility
     variation_factor=0.5  # Default variation factor
 )

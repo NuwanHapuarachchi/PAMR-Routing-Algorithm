@@ -26,7 +26,7 @@ def main():
     from pamr.core.network import network
 
     # Create router with optimized parameters
-    router = PAMRRouter(network.graph, alpha=2.0, beta=3.0, gamma=2.5)
+    router = PAMRRouter(network.graph, alpha=12.0, beta=3.0, gamma=21)
     
     # Create simulator
     simulator = PAMRSimulator(network, router)

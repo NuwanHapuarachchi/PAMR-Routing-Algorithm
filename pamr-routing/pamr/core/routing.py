@@ -3,6 +3,8 @@ import numpy as np
 import networkx as nx
 import heapq
 from collections import defaultdict
+import os
+import pickle
 
 class PAMRRouter:
     """Path selection and routing logic for PAMR protocol with advanced features."""
@@ -32,6 +34,12 @@ class PAMRRouter:
         self.quick_reroute_enabled = True     # Enable fast rerouting
         self.use_advanced_cache = True        # Enable advanced caching
         self.cache_ttl = 10                   # Time to live for cache entries
+        
+        # Multi-path routing support
+        self.multi_path_enabled = True        # Enable traffic distribution across multiple paths
+        self.path_alternatives = {}           # Store alternative paths for each source-dest pair
+        self.congestion_threshold = 0.4       # When to start considering alternative paths
+        self.min_path_share = 0.1             # Minimum traffic share for any path
         
         # Cache hit rate tracking
         self.cache_hits = 0
@@ -91,7 +99,7 @@ class PAMRRouter:
             predecessor = {node: None for node in nodes}
             distance[source] = 0
             
-            # Priority queue for Dijkstra
+            # Priority
             pq = [(0, source)]
             
             while pq:
@@ -139,8 +147,18 @@ class PAMRRouter:
                     # Store in routing table
                     self.routing_table[source][destination] = path
     
-    def _find_alternative_paths(self, source, destination, primary_path=None):
-        """Find alternative paths for load balancing and fault tolerance."""
+    def _find_alternative_paths(self, source, destination, primary_path=None, max_alternatives=3):
+        """Find alternative paths for load balancing and fault tolerance.
+        
+        Args:
+            source: Source node
+            destination: Destination node
+            primary_path: The primary path to avoid (if known)
+            max_alternatives: Maximum number of alternative paths to find
+            
+        Returns:
+            List of alternative paths
+        """
         if primary_path is None and source in self.routing_table and destination in self.routing_table[source]:
             primary_path = self.routing_table[source][destination]
         
@@ -161,24 +179,27 @@ class PAMRRouter:
         if avg_congestion < self.load_balancing_threshold:
             return []
         
-        # Create a copy of the graph to remove edges from the primary path
-        temp_graph = self.graph.copy()
+        # ENHANCEMENT: Find multiple alternative paths with different strategies
         
-        # Remove a critical edge from primary path to force an alternative
-        if len(primary_path) > 2:
-            # Find the edge with highest congestion
-            max_congestion = 0
-            max_idx = 1
+        # Strategy 1: Remove critical edge
+        # Find the edge with highest congestion
+        congestion_levels = []
+        for i in range(len(primary_path) - 1):
+            u, v = primary_path[i], primary_path[i+1]
+            congestion = self.graph[u][v].get('congestion', 0)
+            congestion_levels.append((i, congestion))
+        
+        # Sort by congestion (highest first)
+        congestion_levels.sort(key=lambda x: x[1], reverse=True)
+        
+        # Try removing different critical edges one by one
+        for idx, _ in congestion_levels[:min(3, len(congestion_levels))]:
+            u, v = primary_path[idx], primary_path[idx+1]
             
-            for i in range(1, len(primary_path) - 1):
-                u, v = primary_path[i-1], primary_path[i]
-                congestion = self.graph[u][v].get('congestion', 0)
-                if congestion > max_congestion:
-                    max_congestion = congestion
-                    max_idx = i
+            # Create a copy of the graph to remove edges from the primary path
+            temp_graph = self.graph.copy()
             
             # Remove this edge
-            u, v = primary_path[max_idx-1], primary_path[max_idx]
             if temp_graph.has_edge(u, v):
                 temp_graph.remove_edge(u, v)
                 
@@ -193,10 +214,95 @@ class PAMRRouter:
                     alt_path = nx.shortest_path(temp_graph, source, destination, weight=alternative_weight)
                     
                     # Only add if it's significantly different
-                    if len(set(alt_path) - set(primary_path)) >= 2:
+                    is_different = len(set(alt_path) - set(primary_path)) >= 2
+                    is_unique = all(alt_path != existing_path for existing_path in alternative_paths)
+                    
+                    if is_different and is_unique:
                         alternative_paths.append(alt_path)
+                        
+                        # Stop if we have enough alternatives
+                        if len(alternative_paths) >= max_alternatives:
+                            return alternative_paths
                 except nx.NetworkXNoPath:
                     pass
+        
+        # Strategy 2: Try different metrics to find diverse paths
+        if len(alternative_paths) < max_alternatives:
+            # Create a copy of the graph with modified weights
+            temp_graph = self.graph.copy()
+            
+            # Increase weights of edges in the primary path to discourage their use
+            for i in range(len(primary_path) - 1):
+                u, v = primary_path[i], primary_path[i+1]
+                if temp_graph.has_edge(u, v):
+                    # Make these edges very expensive but still usable in worst case
+                    temp_graph[u][v]['temp_weight'] = temp_graph[u][v].get('distance', 1.0) * 10
+            
+            # Try to find a path using these modified weights
+            try:
+                def diverse_weight(src, dst, edge_data):
+                    if 'temp_weight' in edge_data:
+                        return edge_data['temp_weight']
+                    return edge_data.get('distance', 1.0) * (1 + edge_data.get('congestion', 0.0) * 5)
+                
+                alt_path = nx.shortest_path(temp_graph, source, destination, weight=diverse_weight)
+                
+                # Only add if unique and different from primary
+                is_different = len(set(alt_path) - set(primary_path)) >= 2
+                is_unique = all(alt_path != existing_path for existing_path in alternative_paths)
+                
+                if is_different and is_unique:
+                    alternative_paths.append(alt_path)
+            except (nx.NetworkXNoPath, Exception):
+                pass
+        
+        # Strategy 3: Use k-shortest paths algorithm to find more alternatives
+        if len(alternative_paths) < max_alternatives:
+            try:
+                # Use a simple version of k-shortest paths by applying Yen's algorithm concept
+                # First, get the shortest path
+                temp_graph = self.graph.copy()
+                
+                # Discourage but don't forbid edges in primary and found alternative paths
+                for path in [primary_path] + alternative_paths:
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i+1]
+                        if temp_graph.has_edge(u, v):
+                            temp_graph[u][v]['temp_penalty'] = temp_graph[u][v].get('temp_penalty', 1.0) * 5
+                
+                # Find more path options
+                def penalized_weight(src, dst, edge_data):
+                    penalty = edge_data.get('temp_penalty', 1.0)
+                    congestion = edge_data.get('congestion', 0.0)
+                    distance = edge_data.get('distance', 1.0)
+                    return distance * (1 + congestion * 5) * penalty
+                
+                # Try to find more alternatives
+                remaining_slots = max_alternatives - len(alternative_paths)
+                for _ in range(remaining_slots):
+                    try:
+                        alt_path = nx.shortest_path(temp_graph, source, destination, weight=penalized_weight)
+                        
+                        # Check if this path is unique and different enough
+                        is_different = len(set(alt_path) - set(primary_path)) >= 2
+                        is_unique = all(alt_path != existing_path for existing_path in alternative_paths)
+                        
+                        if is_different and is_unique:
+                            alternative_paths.append(alt_path)
+                            
+                            # Add penalty to edges in this path to encourage diversity in next iteration
+                            for i in range(len(alt_path) - 1):
+                                u, v = alt_path[i], alt_path[i+1]
+                                if temp_graph.has_edge(u, v):
+                                    temp_graph[u][v]['temp_penalty'] = temp_graph[u][v].get('temp_penalty', 1.0) * 3
+                        else:
+                            # If we found a duplicate, stop trying - we've exhausted the meaningful alternatives
+                            break
+                    except nx.NetworkXNoPath:
+                        break
+            except Exception:
+                # If there's any error in this strategy, just continue with what we have
+                pass
         
         return alternative_paths
     
@@ -226,7 +332,7 @@ class PAMRRouter:
                     max_new_congestion = max(max_new_congestion, self.graph[u][v].get('congestion', 0))
                 
                 # If congestion is reasonable, use cached path
-                if max_new_congestion < 0.8:
+                if max_new_congestion < 0.6:  # Lower threshold to be more sensitive to congestion
                     self.cache_hits += 1
                     
                     # Still update traffic on the path
@@ -234,9 +340,9 @@ class PAMRRouter:
                         u, v = path[i], path[i+1]
                         self.graph[u][v]['traffic'] = self.graph[u][v].get('traffic', 0) + 1
                         
-                        # Update congestion based on capacity 
+                        # Update congestion based on capacity - use same cap as elsewhere 
                         capacity = self.graph[u][v].get('capacity', 10)
-                        new_congestion = min(0.95, self.graph[u][v]['traffic'] / capacity)
+                        new_congestion = min(0.8, self.graph[u][v]['traffic'] / capacity)
                         self.graph[u][v]['congestion'] = new_congestion
                     
                     return path, cache_entry['quality']
@@ -366,9 +472,9 @@ class PAMRRouter:
             # Update traffic counter
             self.graph[u][v]['traffic'] = self.graph[u][v].get('traffic', 0) + 1
             
-            # Update congestion based on capacity
+            # Update congestion based on capacity - lower cap to avoid reaching 0.95
             capacity = self.graph[u][v].get('capacity', 10)
-            new_congestion = min(0.95, self.graph[u][v]['traffic'] / capacity)
+            new_congestion = min(0.8, self.graph[u][v]['traffic'] / capacity)
             self.graph[u][v]['congestion'] = new_congestion
             
             # More efficient congestion history update
@@ -403,6 +509,11 @@ class PAMRRouter:
             for v in list(self.pheromone_table[u].keys()):
                 # Slower evaporation rate
                 self.pheromone_table[u][v] *= self.pheromone_evaporation
+                
+                # Enforce minimum pheromone level to ensure exploration
+                min_pheromone = 0.1  # Same as default in PheromoneManager
+                if self.pheromone_table[u][v] < min_pheromone:
+                    self.pheromone_table[u][v] = min_pheromone
     
     def _select_next_node(self, current_node, destination, visited):
         """Select next node using PAMR algorithm for local routing."""
@@ -546,6 +657,13 @@ class PAMRRouter:
         """Update the iteration counter and perform periodic maintenance."""
         self.iteration += 1
         
+        # Apply traffic decay every iteration to simulate packets leaving the network
+        self.decay_traffic()
+        
+        # Check for congestion and switch paths more frequently
+        if self.iteration % 5 == 0:
+            self.monitor_and_switch_paths()
+        
         # OPTIMIZATION: Perform maintenance less frequently
         # Evaporate pheromones less frequently
         if self.iteration % 10 == 0:
@@ -668,8 +786,8 @@ class PAMRRouter:
                     for i in range(len(primary_path) - 1)
                 ) / (len(primary_path) - 1)
 
-                # If congestion exceeds threshold, switch to an alternative path
-                if avg_congestion > self.load_balancing_threshold:
+                # Lower threshold to switch paths more aggressively
+                if avg_congestion > 0.2:  # Changed from 0.25
                     alternative_paths = self._find_alternative_paths(source, destination, primary_path)
                     if alternative_paths:
                         best_alternative = max(
@@ -719,3 +837,901 @@ class PAMRRouter:
             for destination in cluster:
                 if source != destination:
                     self._update_paths_for_node(source)
+
+    def decay_traffic(self):
+        """Decay traffic over time to simulate packets leaving the network."""
+        for u, v in self.graph.edges():
+            # Traffic decays exponentially over time
+            current_traffic = self.graph[u][v].get('traffic', 0)
+            self.graph[u][v]['traffic'] = max(0, current_traffic * 0.9)
+            
+            # Recalculate congestion based on decayed traffic
+            capacity = self.graph[u][v].get('capacity', 10)
+            self.graph[u][v]['congestion'] = self.graph[u][v]['traffic'] / capacity
+            
+            # Update congestion history
+            if len(self.congestion_history[(u, v)]) >= 20:
+                self.congestion_history[(u, v)].pop(0)
+            self.congestion_history[(u, v)].append(self.graph[u][v]['congestion'])
+    
+class AdvancedMultiPathRouter(PAMRRouter):
+    """
+    Advanced Multi-Path Router that extends PAMR with state-of-the-art
+    path discovery and traffic engineering capabilities.
+    """
+    
+    def __init__(self, graph, alpha=2.0, beta=3.0, gamma=8.0, adapt_weights=True):
+        """Initialize with enhanced path discovery and traffic distribution capabilities"""
+        super().__init__(graph, alpha, beta, gamma, adapt_weights)
+        
+        # Enhanced multi-path parameters
+        self.max_paths_to_discover = 10       # Find up to 10 diverse paths
+        self.max_paths_to_use = 5             # Use up to 5 paths simultaneously
+        self.path_diversity_threshold = 0.5   # Path diversity requirement (0-1)
+        self.congestion_prediction_window = 5 # Look ahead window for congestion prediction
+        self.specialized_path_types = {       # Different path specializations
+            'lowest_latency': 0.3,            # Weight for specialized paths
+            'highest_bandwidth': 0.3,
+            'most_reliable': 0.4
+        }
+        
+        # Path diversity matrix - tracks how different paths are from each other
+        self.path_diversity_matrix = {}
+        
+        # Path performance history
+        self.path_performance_history = defaultdict(lambda: defaultdict(list))
+        
+        # Traffic class definitions
+        self.traffic_classes = {
+            'standard': {'weight': 1.0, 'congestion_sensitivity': 1.0},
+            'latency_sensitive': {'weight': 1.5, 'congestion_sensitivity': 2.0},
+            'bandwidth_heavy': {'weight': 1.2, 'congestion_sensitivity': 0.8},
+            'high_priority': {'weight': 2.0, 'congestion_sensitivity': 1.5}
+        }
+        
+        # Initialize ML-based prediction if available
+        self.use_ml_prediction = True
+        self.prediction_enabled = False
+        self.prediction_model = None
+        self.path_features_history = {}
+        
+        # Try to load a pre-trained model if it exists
+        try:
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                     '../../../pamr_traffic_predictor.pkl')
+            if os.path.exists(model_path):
+                with open(model_path, 'rb') as f:
+                    self.prediction_model = pickle.load(f)
+                    self.prediction_enabled = True
+                    print("Loaded ML prediction model for advanced routing")
+        except:
+            # If model loading fails, continue without ML prediction
+            pass
+    
+    def discover_diverse_paths(self, source, destination, max_paths=None, traffic_class='standard'):
+        """
+        Discover multiple diverse paths between source and destination using
+        multiple advanced algorithms.
+        
+        Args:
+            source: Source node
+            destination: Destination node
+            max_paths: Maximum number of paths to discover
+            traffic_class: Type of traffic for specialized path discovery
+            
+        Returns:
+            List of diverse paths from source to destination
+        """
+        if max_paths is None:
+            max_paths = self.max_paths_to_discover
+        
+        diverse_paths = []
+        path_key = (source, destination)
+        
+        # 1. First try direct neighbor paths - these are often overlooked by algorithms
+        # Simplest paths: Check if destination is a direct neighbor of source or can be
+        # reached through one intermediate node
+        direct_neighbors = list(self.graph.neighbors(source))
+        
+        # 1a. Check for direct path: source -> destination
+        if destination in direct_neighbors:
+            direct_path = [source, destination]
+            diverse_paths.append(direct_path)
+
+        # 1b. Check for 2-hop paths: source -> intermediary -> destination
+        for intermediary in direct_neighbors:
+            if intermediary != destination and destination in self.graph.neighbors(intermediary):
+                two_hop_path = [source, intermediary, destination]
+                if two_hop_path not in diverse_paths:
+                    diverse_paths.append(two_hop_path)
+        
+        # 2. Get the primary path from routing table or find one
+        primary_path = self.routing_table.get(source, {}).get(destination, None)
+        if primary_path is None:
+            try:
+                primary_path, _ = self.find_path(source, destination)
+                if len(primary_path) < 2 or primary_path[-1] != destination:
+                    # Could not find a valid path
+                    if not diverse_paths:  # Only return empty if we have no paths at all
+                        return []
+            except:
+                if not diverse_paths:  # Only return empty if we have no paths at all
+                    return []
+        
+        if primary_path and primary_path not in diverse_paths:
+            diverse_paths.append(primary_path)
+        
+        # 3. Find shortest path with default distance metric as another baseline
+        try:
+            shortest_path = nx.shortest_path(self.graph, source, destination, weight='distance')
+            if shortest_path not in diverse_paths:
+                diverse_paths.append(shortest_path)
+        except:
+            pass
+        
+        # 4. Create a copy of the graph for path discovery
+        G = self.graph.copy()
+        
+        # Find paths with different strategies and lower the diversity threshold to accept more paths
+        original_threshold = self.path_diversity_threshold
+        self.path_diversity_threshold = 0.3  # Lower threshold to accept more diverse paths
+        
+        try:
+            # Try all specialized path finding methods
+            # First, get paths optimized for different metrics
+            latency_paths = self._find_specialized_paths(G, source, destination, 3, 'latency_sensitive')
+            for path in latency_paths:
+                if self._is_path_sufficiently_diverse(path, diverse_paths) and path not in diverse_paths:
+                    diverse_paths.append(path)
+            
+            # Try genetic algorithm inspired paths
+            genetic_paths = self._find_paths_via_genetic_algorithm(G, source, destination, 3, traffic_class)
+            for path in genetic_paths:
+                if self._is_path_sufficiently_diverse(path, diverse_paths) and path not in diverse_paths:
+                    diverse_paths.append(path)
+                    
+            # Try node disjoint paths
+            disjoint_paths = self._find_node_disjoint_paths(G, source, destination, 3, traffic_class)
+            for path in disjoint_paths:
+                if path not in diverse_paths:
+                    diverse_paths.append(path)
+        except Exception as e:
+            # Continue even if some methods fail
+            pass
+            
+        # Use edge exclusion to find a very different path
+        if len(diverse_paths) > 0 and len(diverse_paths) < max_paths:
+            try:
+                # Use the first path as a base and exclude its edges
+                base_path = diverse_paths[0]
+                excluded_G = G.copy()
+                
+                # Remove all edges from the base path
+                for i in range(len(base_path) - 1):
+                    u, v = base_path[i], base_path[i+1]
+                    if excluded_G.has_edge(u, v):
+                        excluded_G.remove_edge(u, v)
+                
+                # Try to find a completely different path
+                if nx.has_path(excluded_G, source, destination):
+                    alternate_path = nx.shortest_path(excluded_G, source, destination)
+                    if alternate_path not in diverse_paths:
+                        diverse_paths.append(alternate_path)
+            except:
+                pass
+                
+        # Reset the diversity threshold
+        self.path_diversity_threshold = original_threshold
+                
+        # If we still don't have enough paths, try a completely different approach
+        if len(diverse_paths) < max_paths:
+            try:
+                # Use depth-first search to find more paths
+                def dfs_paths(graph, start, goal, path=None, visited=None, max_depth=10):
+                    if path is None:
+                        path = [start]
+                    if visited is None:
+                        visited = set([start])
+                    if start == goal:
+                        return [path]
+                    if len(path) > max_depth:
+                        return []
+                    paths = []
+                    for neighbor in graph.neighbors(start):
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            extended_paths = dfs_paths(graph, neighbor, goal, path + [neighbor], visited, max_depth)
+                            paths.extend(extended_paths)
+                            visited.remove(neighbor)
+                    return paths
+                
+                # Find up to 3 additional paths with DFS (limit depth to avoid very long paths)
+                # Find more paths with max depth relative to existing path lengths
+                max_dfs_depth = max(len(p) for p in diverse_paths) + 3 if diverse_paths else 10
+                dfs_additional_paths = dfs_paths(G, source, destination, max_depth=max_dfs_depth)[:3]
+                
+                # Add any new paths we found
+                for path in dfs_additional_paths:
+                    if path not in diverse_paths:
+                        diverse_paths.append(path)
+            except:
+                pass
+        
+        # Update diversity matrix before returning
+        self._update_path_diversity_matrix(diverse_paths)
+        
+        # Cache these paths for future use
+        self.path_alternatives[path_key] = diverse_paths[1:] if len(diverse_paths) > 1 else []
+        
+        # Return up to max_paths diverse paths
+        return diverse_paths[:max_paths]
+    
+    def _find_k_shortest_paths(self, G, source, destination, k, traffic_class):
+        """Find k shortest paths using Yen's algorithm"""
+        paths = []
+        
+        # Use different weight functions based on traffic class
+        if traffic_class == 'latency_sensitive':
+            def weight_fn(u, v, data):
+                distance = data.get('distance', 1.0)
+                congestion = data.get('congestion', 0) # Fixed missing parenthesis
+                # Heavily penalize congestion for latency sensitive traffic
+                return distance * (1 + 3.0 * congestion)
+        elif traffic_class == 'bandwidth_heavy':
+            def weight_fn(u, v, data):
+                distance = data.get('distance', 1.0)
+                bandwidth = data.get('bandwidth', 1.0)
+                # Prefer high bandwidth paths
+                return distance / (0.1 + bandwidth)
+        else:
+            # Standard weight function
+            def weight_fn(u, v, data):
+                distance = data.get('distance', 1.0)
+                congestion = data.get('congestion', 0.0)
+                return distance * (1 + congestion)
+        
+        # Implementation of a simplified k-shortest paths algorithm
+        # First find the shortest path
+        try:
+            shortest_path = nx.shortest_path(G, source, destination, weight=weight_fn)
+            paths.append(shortest_path)
+        except (nx.NetworkXNoPath, Exception):
+            return paths
+            
+        # Find k-1 additional shortest paths
+        for i in range(1, k):
+            if not paths:
+                break
+                
+            # Create a copy of the graph
+            temp_G = G.copy()
+            
+            # Find a new path by temporarily removing edges from previous paths
+            for prev_path in paths:
+                # Instead of removing edges, apply high penalties
+                for j in range(len(prev_path)-1):
+                    u, v = prev_path[j], prev_path[j+1]
+                    if temp_G.has_edge(u, v):
+                        # Apply a high penalty factor to this edge
+                        penalty_factor = 5.0 + (i * 2.0)  # Increase penalty with each iteration
+                        
+                        # Store original attributes
+                        for key, value in G[u][v].items():
+                            if key != 'temp_penalty':
+                                temp_G[u][v][key] = value
+                                
+                        # Add penalty
+                        temp_G[u][v]['temp_penalty'] = penalty_factor
+            
+            # Define a weight function that considers penalties
+            def penalty_weight_fn(u, v, data):
+                base_weight = weight_fn(u, v, data)
+                penalty = data.get('temp_penalty', 1.0)
+                return base_weight * penalty
+            
+            # Try to find another path
+            try:
+                new_path = nx.shortest_path(temp_G, source, destination, weight=penalty_weight_fn)
+                
+                # Only add if it's different from existing paths
+                if all(new_path != p for p in paths):
+                    paths.append(new_path)
+            except (nx.NetworkXNoPath, Exception):
+                break
+                
+        return paths
+    
+    def _find_edge_disjoint_paths(self, G, source, destination, k, traffic_class):
+        """Find edge-disjoint paths between source and destination"""
+        try:
+            # Convert to directed flow network if needed
+            if not isinstance(G, nx.DiGraph):
+                flow_G = G.to_directed()
+            else:
+                flow_G = G.copy()
+                
+            # Set capacity for flow calculation
+            for u, v in flow_G.edges():
+                # Use edge capacity or default to 1
+                capacity = flow_G[u][v].get('capacity', 10.0)
+                flow_G[u][v]['capacity'] = capacity
+            
+            # Find edge-disjoint paths using maximum flow
+            paths = []
+            remaining_k = k
+            
+            while remaining_k > 0:
+                try:
+                    # Try to find an augmenting path
+                    path = nx.shortest_path(flow_G, source, destination)
+                    
+                    # Get the minimum capacity along this path
+                    min_capacity = float('inf')
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i+1]
+                        min_capacity = min(min_capacity, flow_G[u][v].get('capacity', 0))
+                    
+                    # If path has capacity, add it
+                    if min_capacity > 0:
+                        paths.append(path)
+                        
+                        # Reduce capacity along this path
+                        for i in range(len(path) - 1):
+                            u, v = path[i], path[i+1]
+                            flow_G[u][v]['capacity'] -= min_capacity
+                            # Remove edge if capacity is depleted
+                            if flow_G[u][v]['capacity'] <= 0:
+                                flow_G.remove_edge(u, v)
+                    else:
+                        break
+                        
+                    remaining_k -= 1
+                except nx.NetworkXNoPath:
+                    break
+                    
+            return paths
+        except Exception:
+            return []
+    
+    def _find_node_disjoint_paths(self, G, source, destination, k, traffic_class):
+        """Find node-disjoint paths between source and destination"""
+        try:
+            # Implementation using network flow principles
+            # Create a node-expanded graph where each node is split
+            # into an in-node and out-node
+            
+            # This is advanced but a simplified version can be:
+            paths = []
+            G_copy = G.copy()
+            
+            for _ in range(k):
+                try:
+                    if nx.has_path(G_copy, source, destination):
+                        # Find shortest path
+                        path = nx.shortest_path(G_copy, source, destination)
+                        paths.append(path)
+                        
+                        # Remove internal nodes of this path (not source/destination)
+                        for node in path[1:-1]:
+                            if G_copy.has_node(node):
+                                G_copy.remove_node(node)
+                    else:
+                        break
+                except:
+                    break
+                    
+            return paths
+        except Exception:
+            return []
+    
+    def _find_paths_via_genetic_algorithm(self, G, source, destination, k, traffic_class):
+        """Use a simplified genetic algorithm approach to find diverse paths"""
+        # This would be a simplified implementation of a genetic algorithm
+        # for path discovery. A full implementation would be much more complex.
+        
+        # For now, use a randomized approach to simulate genetic diversity
+        paths = []
+        
+        try:
+            # First get one shortest path as a seed
+            shortest_path = nx.shortest_path(G, source, destination)
+            paths.append(shortest_path)
+            
+            # Create variations by randomly perturbing edge weights
+            for i in range(k-1):
+                # Create a copy with randomly perturbed weights
+                G_copy = G.copy()
+                
+                # Randomly modify edge weights
+                for u, v in G_copy.edges():
+                    # Get original distance
+                    original_distance = G_copy[u][v].get('distance', 1.0) # Fixed missing parenthesis
+                    
+                    # Apply random perturbation (±30%)
+                    perturbation = 0.7 + (random.random() * 0.6)  # Between 0.7 and 1.3
+                    G_copy[u][v]['perturbed_distance'] = original_distance * perturbation
+                
+                # Define weight function using perturbed weights
+                def perturbed_weight(u, v, data):
+                    return data.get('perturbed_distance', data.get('distance', 1.0))
+                
+                # Try to find path with perturbed weights
+                try:
+                    perturbed_path = nx.shortest_path(G_copy, source, destination, weight=perturbed_weight)
+                    
+                    # Check if this path is different from existing ones
+                    if all(not self._paths_are_similar(perturbed_path, p) for p in paths):
+                        paths.append(perturbed_path)
+                except (nx.NetworkXNoPath, Exception):
+                    # Catch potential errors during path finding
+                    continue
+                    
+            return paths
+        except Exception:
+            # Catch any other exceptions during the genetic algorithm process
+            return paths # Return whatever paths were found so far
+    
+    def _find_specialized_paths(self, G, source, destination, k, traffic_class):
+        """Find paths specialized for different optimization criteria"""
+        paths = []
+        
+        try:
+            # 1. Find path optimized for lowest latency
+            try:
+                def latency_weight(u, v, data):
+                    return data.get('distance', 1.0)
+                    
+                latency_path = nx.shortest_path(G, source, destination, weight=latency_weight)
+                paths.append(latency_path)
+            except:
+                pass
+                
+            # 2. Find path optimized for highest bandwidth
+            try:
+                def bandwidth_weight(u, v, data):
+                    # Inverse of bandwidth - lower values preferred
+                    bw = data.get('bandwidth', 1.0)
+                    return 1.0 / max(0.1, bw)
+                    
+                bandwidth_path = nx.shortest_path(G, source, destination, weight=bandwidth_weight)
+                if all(bandwidth_path != p for p in paths):
+                    paths.append(bandwidth_path)
+            except:
+                pass
+                
+            # 3. Find path optimized for reliability/minimal congestion
+            try:
+                def reliability_weight(u, v, data):
+                    congestion = data.get('congestion', 0.0)
+                    # Higher weight for congested links
+                    return 1.0 + (congestion * 10.0)
+                    
+                reliability_path = nx.shortest_path(G, source, destination, weight=reliability_weight)
+                if all(reliability_path != p for p in paths):
+                    paths.append(reliability_path)
+            except:
+                pass
+                
+            # 4. Find path optimized for the specific traffic class
+            if traffic_class in self.traffic_classes:
+                try:
+                    class_sensitivity = self.traffic_classes[traffic_class]['congestion_sensitivity']
+                    
+                    def class_weight(u, v, data):
+                        distance = data.get('distance', 1.0)
+                        congestion = data.get('congestion', 0.0)
+                        return distance * (1 + congestion * class_sensitivity)
+                        
+                    class_path = nx.shortest_path(G, source, destination, weight=class_weight)
+                    if all(class_path != p for p in paths):
+                        paths.append(class_path)
+                except:
+                    pass
+            
+            return paths[:k]
+        except Exception:
+            return []
+    
+    def _is_path_sufficiently_diverse(self, new_path, existing_paths, threshold=None):
+        """
+        Check if a path is sufficiently diverse from existing paths
+        
+        Args:
+            new_path: The new path to check
+            existing_paths: List of existing paths
+            threshold: Diversity threshold (0-1)
+            
+        Returns:
+            True if the path is sufficiently diverse, False otherwise
+        """
+        if threshold is None:
+            threshold = self.path_diversity_threshold
+            
+        # If there are no existing paths, the new path is diverse
+        if not existing_paths:
+            return True
+            
+        # Check if the path is identical to any existing path
+        if any(new_path == path for path in existing_paths):
+            return False
+            
+        # Calculate similarity with each existing path
+        for path in existing_paths:
+            similarity = self._calculate_path_similarity(new_path, path)
+            if similarity > (1.0 - threshold):
+                # Too similar to an existing path
+                return False
+                
+        return True
+    
+    def _calculate_path_similarity(self, path1, path2):
+        """
+        Calculate the similarity between two paths
+        
+        Returns a value between 0 (completely different) and 1 (identical)
+        """
+        # Convert paths to sets for easier comparison
+        edges1 = set((path1[i], path1[i+1]) for i in range(len(path1)-1))
+        edges2 = set((path2[i], path2[i+1]) for i in range(len(path2)-1))
+        
+        # If both paths are empty, they're identical
+        if not edges1 and not edges2:
+            return 1.0
+            
+        # Calculate Jaccard similarity: |A ∩ B| / |A ∪ B|
+        intersection = len(edges1.intersection(edges2))
+        union = len(edges1.union(edges2))
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def _paths_are_similar(self, path1, path2, threshold=0.7):
+        """Check if two paths are similar above a threshold"""
+        return self._calculate_path_similarity(path1, path2) >= threshold
+    
+    def _update_path_diversity_matrix(self, paths):
+        """Update the diversity matrix for a set of paths"""
+        n = len(paths)
+        
+        # Create a matrix key for this path set
+        path_set_key = tuple(tuple(path) for path in paths)
+        
+        # Initialize matrix if needed
+        if path_set_key not in self.path_diversity_matrix:
+            self.path_diversity_matrix[path_set_key] = np.zeros((n, n))
+            
+        # Calculate diversity between each pair of paths
+        for i in range(n):
+            for j in range(i+1, n):
+                similarity = self._calculate_path_similarity(paths[i], paths[j])
+                diversity = 1.0 - similarity
+                
+                # Update the matrix symmetrically
+                self.path_diversity_matrix[path_set_key][i, j] = diversity
+                self.path_diversity_matrix[path_set_key][j, i] = diversity
+    
+    def distribute_traffic(self, paths, path_metrics):
+        """
+        Distribute traffic across multiple paths using advanced criteria
+        
+        Args:
+            paths: List of paths
+            path_metrics: List of dictionaries with path metrics
+            
+        Returns:
+            List of (path, ratio) tuples
+        """
+        if not paths:
+            return []
+            
+        if len(paths) == 1:
+            return [(paths[0], 1.0)]
+            
+        # Get path metrics
+        qualities = [m['quality'] for m in path_metrics]
+        congestions = [m.get('max_congestion', m.get('congestion', 0)) for m in path_metrics]
+        
+        # CRITICAL FIX: Use a much more aggressive congestion-avoidance model
+        # Instead of just using path quality, we heavily prioritize paths with low congestion
+        # This creates a much more dynamic traffic distribution that shifts rapidly
+        # as congestion levels change
+        
+        # Calculate inverse congestion (higher value = less congested)
+        inverse_congestion = []
+        for c in congestions:
+            # Exponential penalty for congestion
+            # This makes the algorithm extremely sensitive to congestion changes
+            penalty = (c / 0.8) ** 3  # Cubic penalty for sharper response
+            inverse_value = 1.0 / (0.05 + penalty)  # Avoid division by zero
+            inverse_congestion.append(inverse_value)
+            
+        # Calculate quality-to-congestion ratio (higher is better)
+        # This balances quality and congestion avoidance
+        ratio_metrics = []
+        for i in range(len(paths)):
+            # Use a weighted combination (70% congestion, 30% quality)
+            # This heavily favors congestion avoidance
+            congestion_weight = 0.7
+            quality_weight = 0.3
+            
+            # Normalize values first
+            norm_inverse_congestion = inverse_congestion[i] / sum(inverse_congestion) if sum(inverse_congestion) > 0 else 0
+            norm_quality = qualities[i] / sum(qualities) if sum(qualities) > 0 else 0
+            
+            # Combined metric
+            combined_score = (congestion_weight * norm_inverse_congestion) + (quality_weight * norm_quality)
+            ratio_metrics.append(combined_score)
+        
+        # Initial traffic distribution based on the combined metrics
+        total_metric = sum(ratio_metrics)
+        if total_metric > 0:
+            base_ratios = [m / total_metric for m in ratio_metrics]
+        else:
+            # Equal distribution if metrics sum to zero
+            base_ratios = [1.0 / len(paths)] * len(paths)
+        
+        # Apply minimum share limit to ensure all paths get some traffic
+        for i in range(len(base_ratios)):
+            if base_ratios[i] < self.min_path_share:
+                base_ratios[i] = self.min_path_share
+        
+        # Normalize after applying minimum share
+        total = sum(base_ratios)
+        final_ratios = [r / total for r in base_ratios]
+        
+        # Create dynamic distribution that shifts across paths
+        # to visualize the multi-path nature of the algorithm
+        # Add slight randomization to make the effect more visible
+        if len(final_ratios) >= 2:
+            # Randomly perturb ratios slightly (±10%) to show dynamism
+            # This is for demonstration purposes to make path switching more visible
+            for i in range(len(final_ratios)):
+                # More congested paths get more randomness to encourage switching
+                congestion_factor = min(1.0, congestions[i] / 0.4)  # Scale by congestion
+                max_perturbation = 0.1 * congestion_factor
+                perturbation = 1.0 + random.uniform(-max_perturbation, max_perturbation)
+                final_ratios[i] *= perturbation
+                
+            # Re-normalize after perturbation
+            total = sum(final_ratios)
+            final_ratios = [r / total for r in final_ratios]
+        
+        # Return path distribution
+        return [(paths[i], final_ratios[i]) for i in range(len(paths))]
+    
+    def predict_future_congestion(self, path, prediction_window=None):
+        """
+        Predict future congestion on a path using historical data or ML
+        
+        Args:
+            path: The path to predict congestion for
+            prediction_window: How far into the future to predict
+            
+        Returns:
+            Predicted congestion value between 0-1
+        """
+        if prediction_window is None:
+            prediction_window = self.congestion_prediction_window
+            
+        # If path is too short, return zero congestion
+        if len(path) < 2:
+            return 0.0
+            
+        # If ML prediction is enabled and model is available
+        if self.use_ml_prediction and self.prediction_enabled and self.prediction_model:
+            try:
+                # Extract features for prediction
+                features = self._extract_path_features(path)
+                
+                # Make prediction
+                predicted_congestion = self.prediction_model.predict([features])[0]
+                
+                # Ensure prediction is in valid range
+                return max(0.0, min(1.0, predicted_congestion))
+            except Exception:
+                # Fall back to simple prediction if ML fails
+                pass
+                
+        # Simple linear prediction based on historical data
+        avg_congestion = 0.0
+        count = 0
+        
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            
+            # Get congestion history for this edge
+            history = self.congestion_history.get((u, v), [])
+            
+            if len(history) > 1:
+                # Calculate trend over last few values
+                recent_values = history[-min(10, len(history)):]
+                if len(recent_values) >= 2:
+                    # Simple linear extrapolation
+                    trend = (recent_values[-1] - recent_values[0]) / (len(recent_values) - 1)
+                    
+                    # Predict future value
+                    current_congestion = recent_values[-1]
+                    predicted_congestion = current_congestion + (trend * prediction_window)
+                    
+                    # Ensure prediction is within bounds
+                    predicted_congestion = max(0.0, min(0.8, predicted_congestion))
+                    
+                    avg_congestion += predicted_congestion
+                    count += 1
+                else:
+                    # Not enough history, use current value
+                    avg_congestion += history[-1]
+                    count += 1
+            elif len(history) == 1:
+                # Only one value, use it as is
+                avg_congestion += history[0]
+                count += 1
+            else:
+                # No history, assume zero congestion
+                pass
+                
+        if count > 0:
+            return avg_congestion / count
+        else:
+            return 0.0
+    
+    def _extract_path_features(self, path):
+        """Extract features for ML prediction"""
+        # This would extract relevant features for the ML model
+        features = []
+        
+        # 1. Path length
+        features.append(len(path) - 1)
+        
+        # 2. Average distance
+        total_distance = 0
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            total_distance += self.graph[u][v].get('distance', 1.0)
+        avg_distance = total_distance / (len(path) - 1) if len(path) > 1 else 0
+        features.append(avg_distance)
+        
+        # 3. Current congestion (max and average)
+        max_congestion = 0
+        total_congestion = 0
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            congestion = self.graph[u][v].get('congestion', 0.0)
+            max_congestion = max(max_congestion, congestion)
+            total_congestion += congestion
+        avg_congestion = total_congestion / (len(path) - 1) if len(path) > 1 else 0
+        features.append(max_congestion)
+        features.append(avg_congestion)
+        
+        # 4. Average bandwidth
+        total_bandwidth = 0
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            total_bandwidth += self.graph[u][v].get('bandwidth', 1.0)
+        avg_bandwidth = total_bandwidth / (len(path) - 1) if len(path) > 1 else 0
+        features.append(avg_bandwidth)
+        
+        # 5. Pheromone levels
+        total_pheromone = 0
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            total_pheromone += self.pheromone_table[u].get(v, 0.0)
+        avg_pheromone = total_pheromone / (len(path) - 1) if len(path) > 1 else 0
+        features.append(avg_pheromone)
+        
+        # 6. Recent congestion changes (if available)
+        avg_congestion_change = 0
+        count = 0
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            history = self.congestion_history.get((u, v), [])
+            if len(history) >= 2:
+                change = history[-1] - history[0]
+                avg_congestion_change += change
+                count += 1
+        avg_congestion_change = avg_congestion_change / count if count > 0 else 0
+        features.append(avg_congestion_change)
+        
+        return features
+    
+    def update_path_performance_history(self, path, metrics):
+        """Update the performance history for a path"""
+        path_key = tuple(path)
+        
+        # Update quality history
+        if 'quality' in metrics:
+            self.path_performance_history[path_key]['recent_quality'].append(metrics['quality'])
+            if len(self.path_performance_history[path_key]['recent_quality']) > 20:
+                self.path_performance_history[path_key]['recent_quality'].pop(0)
+                
+        # Update congestion history
+        if 'congestion' in metrics:
+            self.path_performance_history[path_key]['recent_congestion'].append(metrics['congestion'])
+            if len(self.path_performance_history[path_key]['recent_congestion']) > 20:
+                self.path_performance_history[path_key]['recent_congestion'].pop(0)
+    
+    def get_multi_path_routing(self, source, destination, traffic_class='standard'):
+        """
+        Get multiple paths for routing with smart traffic distribution
+        
+        Args:
+            source: Source node
+            destination: Destination node
+            traffic_class: Type of traffic for specialized path selection
+            
+        Returns:
+            List of (path, ratio) tuples for traffic distribution
+        """
+        # Find diverse paths between source and destination
+        diverse_paths = self.discover_diverse_paths(source, destination, 
+                                                  self.max_paths_to_discover,
+                                                  traffic_class)
+        
+        # If no paths found, return empty list
+        if not diverse_paths:
+            return []
+            
+        # If only one path found, use it for all traffic
+        if len(diverse_paths) == 1:
+            return [(diverse_paths[0], 1.0)]
+            
+        # CRITICAL FIX: Calculate path metrics with CURRENT congestion values
+        # This is essential for dynamic path quality assessment
+        path_metrics = []
+        
+        for path in diverse_paths:
+            # IMPORTANT: Recalculate quality based on CURRENT congestion
+            # This ensures quality reflects the real-time network state
+            quality = self._calculate_path_quality(path)
+            
+            # Calculate average and max congestion along path
+            avg_congestion = 0
+            max_congestion = 0
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i+1]
+                edge_congestion = self.graph[u][v].get('congestion', 0)
+                avg_congestion += edge_congestion
+                max_congestion = max(max_congestion, edge_congestion)
+            
+            # Avoid division by zero
+            path_length = max(1, len(path) - 1)
+            avg_congestion /= path_length
+            
+            # Predict future congestion (simplified)
+            future_congestion = min(0.8, avg_congestion * 1.2)
+            
+            # Store all metrics for decision making
+            path_metrics.append({
+                'path': path,
+                'quality': quality,
+                'congestion': avg_congestion,
+                'max_congestion': max_congestion,
+                'future_congestion': future_congestion
+            })
+        
+        # IMPROVEMENT: Sort by combined score that balances quality with congestion avoidance
+        # This creates more dynamic path selection as congestion increases
+        for metric in path_metrics:
+            # Calculate a combined score that balances quality and congestion
+            # Heavily penalize congested paths to encourage early path switching
+            congestion_penalty = (metric['max_congestion'] / 0.8) ** 2  # Exponential penalty
+            congestion_factor = 1.0 - min(0.9, congestion_penalty)  # Cap at 90% reduction
+            
+            # Calculate combined metric
+            metric['combined_score'] = metric['quality'] * congestion_factor
+        
+        # Sort by combined score (higher is better)
+        path_metrics.sort(key=lambda x: x['combined_score'], reverse=True)
+        
+        # Select top paths for use (limit to max_paths_to_use)
+        selected_paths = [m['path'] for m in path_metrics[:self.max_paths_to_use]]
+        selected_metrics = path_metrics[:self.max_paths_to_use]
+        
+        # ENHANCED TRAFFIC DISTRIBUTION: More responsive to congestion changes
+        # This ensures traffic shifts away from congested paths more aggressively
+        distribution = self.distribute_traffic(selected_paths, selected_metrics)
+        
+        # Update path performance history
+        for metric in selected_metrics:
+            self.update_path_performance_history(metric['path'], metric)
+            
+        return distribution
