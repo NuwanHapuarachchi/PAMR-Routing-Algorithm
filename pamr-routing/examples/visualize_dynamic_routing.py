@@ -649,7 +649,7 @@ class RoutingVisualizer:
     
     def send_packets_multi_path(self, source, destination, num_packets=1, visualize=False, output_path=None):
         """
-        Send packets from source to destination using multiple paths simultaneously
+        Send packets from source to destination using multiple paths with alternating path selection
         
         Args:
             source: Source node ID
@@ -672,6 +672,9 @@ class RoutingVisualizer:
         # Track distribution of packets
         path_distribution = {}
         
+        # Path cache to store discovered paths between source and destination
+        path_cache = []
+        
         for i in range(num_packets):
             # Get multiple paths with distribution ratios
             path_options = self.router.get_multi_path_routing(source, destination)
@@ -680,102 +683,96 @@ class RoutingVisualizer:
                 print(f"No path found from {source} to {destination}")
                 break
                 
-            # Find the primary path (highest ratio)
-            primary_path, primary_ratio = max(path_options, key=lambda x: x[1])
-            primary_path_str = '->'.join([str(node) for node in primary_path])
+            # Store all paths in our cache if this is a new discovery
+            if not path_cache:
+                path_cache = [path for path, _ in path_options]
             
-            # Calculate quality and congestion for the primary path
-            primary_quality = self.router._calculate_path_quality(primary_path)
+            # Select a path for this packet - rotate through paths to balance traffic
+            # This implements true per-packet multi-path routing
+            selected_path_idx = i % len(path_options)
+            path, _ = path_options[selected_path_idx]
             
-            # Calculate max congestion on primary path
-            primary_max_congestion = 0
-            for j in range(len(primary_path)-1):
-                u, v = primary_path[j], primary_path[j+1]
-                primary_max_congestion = max(primary_max_congestion, 
-                                            self.network.graph[u][v].get('congestion', 0))
+            path_str = '->'.join([str(node) for node in path])
             
-            # Print detailed information about the primary path
-            print(f"Packet {i+1}: Path {primary_path_str} | Quality: {primary_quality:.4f} | Max Congestion: {primary_max_congestion:.4f}")
+            # Calculate quality and congestion for the path
+            quality = self.router._calculate_path_quality(path)
             
-            # If there are multiple paths, show them as alternatives
+            # Calculate max congestion on path
+            max_congestion = 0
+            for j in range(len(path)-1):
+                u, v = path[j], path[j+1]
+                max_congestion = max(max_congestion, 
+                                    self.network.graph[u][v].get('congestion', 0))
+            
+            # Print detailed information about the selected path
+            print(f"Packet {i+1}: Path {path_str} | Quality: {quality:.4f} | Max Congestion: {max_congestion:.4f}")
+            
+            # Show alternative paths that could have been taken
             if len(path_options) > 1:
                 print(f"  Alternative paths:")
-                for idx, (path, ratio) in enumerate(path_options):
-                    if path != primary_path:  # Skip the primary path as we've already shown it
-                        path_str = '->'.join([str(node) for node in path])
-                        path_quality = self.router._calculate_path_quality(path)
+                for idx, (alt_path, ratio) in enumerate(path_options):
+                    if alt_path != path:  # Skip the selected path as we've already shown it
+                        alt_path_str = '->'.join([str(node) for node in alt_path])
+                        alt_path_quality = self.router._calculate_path_quality(alt_path)
                         
-                        # Calculate max congestion on this path
-                        path_max_congestion = 0
-                        for j in range(len(path)-1):
-                            u, v = path[j], path[j+1]
-                            path_max_congestion = max(path_max_congestion, 
-                                                      self.network.graph[u][v].get('congestion', 0))
+                        # Calculate max congestion on this alternate path
+                        alt_path_max_congestion = 0
+                        for j in range(len(alt_path)-1):
+                            u, v = alt_path[j], alt_path[j+1]
+                            alt_path_max_congestion = max(alt_path_max_congestion, 
+                                                     self.network.graph[u][v].get('congestion', 0))
                                                       
-                        print(f"    Path: {path_str} | Quality: {path_quality:.4f} | Max Congestion: {path_max_congestion:.4f} | Traffic Share: {ratio:.2f}")
+                        print(f"    Path: {alt_path_str} | Quality: {alt_path_quality:.4f} | Max Congestion: {alt_path_max_congestion:.4f}")
                 
             # Track this path for visualization
-            if primary_path_str not in path_distribution:
-                path_distribution[primary_path_str] = 0
-            path_distribution[primary_path_str] += primary_ratio
+            if path_str not in path_distribution:
+                path_distribution[path_str] = 0
+            path_distribution[path_str] += 1
             
-            # Simulate sending packets according to the distribution ratios
-            for path, ratio in path_options:
-                # Round the ratio to determine how many packets to send on this path
-                packets_on_path = max(1, round(ratio * 1.0))  # At least 1 packet
+            # Recalculate current path quality based on actual congestion
+            quality = self.router._calculate_path_quality(path)
+            
+            # Update metrics for this path
+            all_paths.append(path)
+            all_qualities.append(quality)
+            
+            # Update traffic on this path - only on the selected path, not on all paths
+            for j in range(len(path)-1):
+                u, v = path[j], path[j+1]
                 
-                if packets_on_path > 0:
-                    path_str = '->'.join([str(node) for node in path])
-                    
-                    # Recalculate current path quality based on actual congestion
-                    quality = self.router._calculate_path_quality(path)
-                    
-                    # Update metrics for this path
-                    all_paths.append(path)
-                    all_qualities.append(quality)
-                    
-                    # Calculate max congestion on this path
-                    max_congestion = 0
-                    
-                    # Update traffic on this path proportionally
-                    for j in range(len(path)-1):
-                        u, v = path[j], path[j+1]
-                        
-                        # Add fractional traffic based on ratio
-                        self.network.graph[u][v]['traffic'] += packets_on_path
-                        
-                        # Update congestion
-                        capacity = self.network.graph[u][v].get('capacity', 10)
-                        new_congestion = min(0.6, self.network.graph[u][v]['traffic'] / capacity)
-                        self.network.graph[u][v]['congestion'] = new_congestion
-                        
-                        # Track max congestion
-                        max_congestion = max(max_congestion, new_congestion)
-                    
-                    all_congestion.append(max_congestion)
-                    
-                    # Store path for visualization
-                    key = (source, destination)
-                    # Track only the primary path for visualization simplicity
-                    if ratio == max([r for _, r in path_options]):
-                        self.metrics['active_paths'][key] = path
+                # Add single packet of traffic (value of 1.0)
+                self.network.graph[u][v]['traffic'] += 1.0
+                
+                # Update congestion
+                capacity = self.network.graph[u][v].get('capacity', 10)
+                new_congestion = min(0.6, self.network.graph[u][v]['traffic'] / capacity)
+                self.network.graph[u][v]['congestion'] = new_congestion
+                
+                # Track max congestion
+                max_congestion = max(max_congestion, new_congestion)
             
-            # Update our visualization metrics with primary path data
+            all_congestion.append(max_congestion)
+            
+            # Store path for visualization
+            key = (source, destination)
+            self.metrics['active_paths'][key] = path
+            
+            # Update our visualization metrics with current path data
             self.metrics['iterations'].append(i+1)
-            self.metrics['path_quality'].append(primary_quality)
-            self.metrics['path_lengths'].append(len(primary_path)-1)
-            self.metrics['congestion_levels'].append(primary_max_congestion)
+            self.metrics['path_quality'].append(quality)
+            self.metrics['path_lengths'].append(len(path)-1)
+            self.metrics['congestion_levels'].append(max_congestion)
             
             # Calculate avg pheromone on primary path
             total_pheromone = 0
-            for j in range(len(primary_path)-1):
-                u, v = primary_path[j], primary_path[j+1]
+            for j in range(len(path)-1):
+                u, v = path[j], path[j+1]
                 total_pheromone += self.router.pheromone_table[u].get(v, 0)
-            avg_pheromone = total_pheromone / (len(primary_path)-1) if len(primary_path) > 1 else 0
+            avg_pheromone = total_pheromone / (len(path)-1) if len(path) > 1 else 0
             self.metrics['pheromone_levels'].append(avg_pheromone)
             
             # Store all used paths for visualization
-            self.metrics['paths_taken'].append(primary_path)
+            self.metrics['paths_taken'].append(path)
             
             # Update animation if visualizing
             if visualize and i < num_packets-1:
@@ -799,7 +796,7 @@ class RoutingVisualizer:
         sorted_paths = sorted(path_distribution.items(), key=lambda x: x[1], reverse=True)
         print("\nPath Usage Summary:")
         for path_str, usage in sorted_paths:
-            print(f"  {path_str}: {usage:.2f} packets")
+            print(f"  {path_str}: {usage} packets")
             
         # Final visualization step
         if visualize:
