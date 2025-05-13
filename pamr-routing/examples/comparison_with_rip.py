@@ -9,7 +9,6 @@ from collections import defaultdict
 import random
 import time
 from datetime import datetime
-import webbrowser
 
 # Add parent directory to path so we can import the pamr package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -312,14 +311,64 @@ def run_comparison(num_iterations=200, packets_per_iter=75):
         rip_path, rip_quality = rip_router.find_path(src, dst)
         
         if pamr_path and rip_path:
+            # Calculate comprehensive metrics for both paths
+            pamr_max_congestion = 0
+            pamr_avg_congestion = 0
+            pamr_total_pheromone = 0
+            
+            rip_max_congestion = 0
+            rip_avg_congestion = 0
+            rip_total_pheromone = 0
+            
+            # Calculate PAMR path metrics
+            for i in range(len(pamr_path) - 1):
+                u, v = pamr_path[i], pamr_path[i+1]
+                pamr_max_congestion = max(pamr_max_congestion, pamr_router.graph[u][v].get('congestion', 0))
+                pamr_avg_congestion += pamr_router.graph[u][v].get('congestion', 0)
+                pamr_total_pheromone += pamr_router.pheromone_table[u].get(v, 0)
+            
+            # Calculate RIP path metrics
+            for i in range(len(rip_path) - 1):
+                u, v = rip_path[i], rip_path[i+1]
+                rip_max_congestion = max(rip_max_congestion, rip_router.graph[u][v].get('congestion', 0))
+                rip_avg_congestion += rip_router.graph[u][v].get('congestion', 0)
+                # RIP doesn't use pheromones, but we'll calculate an equivalent value for comparison
+                # We'll use inverse of metric to simulate pheromone (higher = better)
+                metric = rip_router._calculate_rip_metric(u, v)
+                rip_total_pheromone += (1.0 / metric) if metric > 0 else 0
+            
+            pamr_avg_congestion = pamr_avg_congestion / (len(pamr_path) - 1) if len(pamr_path) > 1 else 0
+            rip_avg_congestion = rip_avg_congestion / (len(rip_path) - 1) if len(rip_path) > 1 else 0
+            pamr_avg_pheromone = pamr_total_pheromone / (len(pamr_path) - 1) if len(pamr_path) > 1 else 0
+            rip_avg_pheromone = rip_total_pheromone / (len(rip_path) - 1) if len(rip_path) > 1 else 0
+            
             path_comparisons[(src, dst)] = {
                 'pamr_path': pamr_path,
                 'rip_path': rip_path,
                 'pamr_quality': pamr_quality,
                 'rip_quality': rip_quality,
                 'pamr_length': len(pamr_path) - 1,
-                'rip_length': len(rip_path) - 1
+                'rip_length': len(rip_path) - 1,
+                'pamr_max_congestion': pamr_max_congestion,
+                'rip_max_congestion': rip_max_congestion,
+                'pamr_avg_congestion': pamr_avg_congestion,
+                'rip_avg_congestion': rip_avg_congestion,
+                'pamr_avg_pheromone': pamr_avg_pheromone,
+                'rip_avg_pheromone': rip_avg_pheromone
             }
+            
+            # Print detailed comparison for this source-destination pair
+            print(f"\nPath comparison from Node {src} to Node {dst}:")
+            print(f"  PAMR Path: {pamr_path}")
+            print(f"  RIP Path:  {rip_path}")
+            print(f"  Metrics:")
+            print(f"    {'Metric':<20} {'PAMR':<15} {'RIP':<15} {'Difference (%)':<15}")
+            print(f"    {'-' * 65}")
+            print(f"    {'Path Quality':<20} {pamr_quality:<15.4f} {rip_quality:<15.4f} {((pamr_quality - rip_quality) / max(0.0001, rip_quality) * 100):<15.2f}")
+            print(f"    {'Path Length':<20} {len(pamr_path) - 1:<15d} {len(rip_path) - 1:<15d} {((len(pamr_path) - len(rip_path)) / max(1, len(rip_path) - 1) * 100):<15.2f}")
+            print(f"    {'Max Congestion':<20} {pamr_max_congestion:<15.4f} {rip_max_congestion:<15.4f} {((pamr_max_congestion - rip_max_congestion) / max(0.0001, rip_max_congestion) * 100):<15.2f}")
+            print(f"    {'Avg Congestion':<20} {pamr_avg_congestion:<15.4f} {rip_avg_congestion:<15.4f} {((pamr_avg_congestion - rip_avg_congestion) / max(0.0001, rip_avg_congestion) * 100):<15.2f}")
+            print(f"    {'Avg Pheromone/Merit':<20} {pamr_avg_pheromone:<15.4f} {rip_avg_pheromone:<15.4f} {((pamr_avg_pheromone - rip_avg_pheromone) / max(0.0001, rip_avg_pheromone) * 100):<15.2f}")
     
     # Collect comparison results
     comparison_results = {
@@ -342,10 +391,7 @@ def visualize_comparison(comparison_results, output_dir):
     
     Args:
         comparison_results: Dictionary of comparison results from run_comparison()
-        output_dir: Directory to save visualizations and report
-        
-    Returns:
-        Path to the generated report HTML file
+        output_dir: Directory to save visualizations
     """
     import os
     from datetime import datetime
@@ -525,9 +571,9 @@ def visualize_comparison(comparison_results, output_dir):
     
     # 4. Path comparison visualizations for specific source-destination pairs
     for idx, ((src, dst), data) in enumerate(path_comparisons.items()):
+        # Create a path visualization (existing code)
         plt.figure(figsize=(12, 8))
         
-        # Create a visualization of both paths for this source-destination pair
         # Get the network from our simulation to ensure we're using the same larger test network
         from pamr.core.network import NetworkTopology
         test_network = NetworkTopology(
@@ -592,173 +638,82 @@ def visualize_comparison(comparison_results, output_dir):
         path_viz_file = os.path.join(output_dir, f"pamr_vs_rip_path_{src}_to_{dst}.png")
         plt.savefig(path_viz_file, bbox_inches='tight')
         plt.close()
+        
+        # NEW: Create a bar chart comparing all metrics side by side
+        plt.figure(figsize=(14, 8))
+        
+        # Metrics to compare
+        metrics = [
+            ('Path Quality', data['pamr_quality'], data['rip_quality'], 'Higher is better', 'Blues'),
+            ('Path Length (Hops)', data['pamr_length'], data['rip_length'], 'Lower is better', 'Oranges'),
+            ('Max Congestion', data['pamr_max_congestion'], data['rip_max_congestion'], 'Lower is better', 'Reds'),
+            ('Avg Congestion', data['pamr_avg_congestion'], data['rip_avg_congestion'], 'Lower is better', 'Reds'),
+            ('Pheromone/Merit', data['pamr_avg_pheromone'], data['rip_avg_pheromone'], 'Higher is better', 'Greens')
+        ]
+        
+        # Prepare plot
+        labels = [m[0] for m in metrics]
+        pamr_values = [m[1] for m in metrics]
+        rip_values = [m[2] for m in metrics]
+        x = np.arange(len(labels))
+        width = 0.35
+        
+        # Create bars
+        fig, ax = plt.subplots(figsize=(14, 8))
+        rects1 = ax.bar(x - width/2, pamr_values, width, label='PAMR', color='#3498db', alpha=0.8)
+        rects2 = ax.bar(x + width/2, rip_values, width, label='RIP', color='#e74c3c', alpha=0.8)
+        
+        # Add labels and title
+        ax.set_title(f"Metrics Comparison for Path from Node {src} to Node {dst}", fontsize=16, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=0, fontsize=12)
+        ax.legend(fontsize=12)
+        
+        # Add value annotations on top of each bar
+        def autolabel(rects):
+            for rect in rects:
+                height = rect.get_height()
+                ax.annotate(f"{height:.4f}",
+                            xy=(rect.get_x() + rect.get_width()/2, height),
+                            xytext=(0, 3),
+                            textcoords="offset points",
+                            ha='center', va='bottom',
+                            fontsize=10, fontweight='bold')
+                
+        autolabel(rects1)
+        autolabel(rects2)
+        
+        # Add a note for each metric indicating what's better
+        for i, (_, _, _, note, _) in enumerate(metrics):
+            ax.annotate(note, xy=(i, 0), xytext=(i, -0.05*max(pamr_values+rip_values)),
+                        textcoords="data", ha='center', va='top',
+                        fontsize=10, style='italic', color='gray')
+        
+        # Add percentage difference labels
+        for i, (metric, pamr_val, rip_val, _, _) in enumerate(metrics):
+            if rip_val > 0:
+                pct_diff = ((pamr_val - rip_val) / rip_val) * 100
+                color = 'green' if (pct_diff > 0 and (metric == 'Path Quality' or metric == 'Pheromone/Merit')) or \
+                                   (pct_diff < 0 and (metric == 'Path Length (Hops)' or 'Congestion' in metric)) else 'red'
+                
+                ax.annotate(f"{pct_diff:+.1f}%", 
+                            xy=((x[i] - width/2 + x[i] + width/2)/2, max(pamr_val, rip_val)),
+                            xytext=(0, 10),
+                            textcoords="offset points",
+                            ha='center', va='bottom',
+                            fontsize=11, fontweight='bold', color=color)
+        
+        # Improve layout
+        plt.tight_layout()
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Save the comparison chart
+        metrics_file = os.path.join(output_dir, f"pamr_vs_rip_metrics_{src}_to_{dst}.png")
+        plt.savefig(metrics_file, bbox_inches='tight', dpi=300)
+        plt.close()
     
-    # Generate HTML report
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_filename = f"pamr_vs_rip_comparison_{timestamp}.html"
-    report_path = os.path.join(output_dir, report_filename)
-    
-    with open(report_path, 'w') as f:
-        f.write(f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>PAMR vs RIP Comparison Report</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                h1 {{ color: #2c3e50; }}
-                h2 {{ color: #3498db; }}
-                img {{ max-width: 100%; }}
-                .comparison-section {{ margin-top: 30px; }}
-                .path-comparison {{ margin-top: 20px; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
-                th {{ background-color: #f2f2f2; }}
-            </style>
-        </head>
-        <body>
-            <h1>PAMR vs RIP Routing Comparison Report</h1>
-            <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-            
-            <h2>Simulation Parameters</h2>
-            <table>
-                <tr><th>Parameter</th><th>Value</th></tr>
-                <tr><td>Number of Nodes</td><td>{params['num_nodes']}</td></tr>
-                <tr><td>Network Connectivity</td><td>{params['connectivity']}</td></tr>
-                <tr><td>Number of Iterations</td><td>{params['num_iterations']}</td></tr>
-                <tr><td>Packets per Iteration</td><td>{params['packets_per_iter']}</td></tr>
-            </table>
-            
-            <div class="comparison-section">
-                <h2>Network Topology</h2>
-                <p>The following image shows the pure network topology used in this simulation.</p>
-                <img src="network_topology_rip_comparison.png" alt="Network Topology">
-            </div>
-            
-            <div class="comparison-section">
-                <h2>Overall Performance Metrics</h2>
-                
-                <h3>Convergence Time</h3>
-                <p>This graph shows how quickly each routing algorithm converges to a stable path. RIP typically relies on periodic updates with the Bellman-Ford algorithm, which can be slower to converge especially in larger networks.</p>
-                <img src="convergence_time_comparison_rip.png" alt="Convergence Time Comparison">
-                
-                <h3>Path Quality</h3>
-                <p>This graph compares the quality of paths selected by each routing algorithm. RIP typically selects paths with the fewest hops, while PAMR uses multiple metrics including congestion.</p>
-                <img src="path_quality_comparison_rip.png" alt="Path Quality Comparison">
-                
-                <h3>Traffic Distribution</h3>
-                <p>This graph shows how traffic is distributed across the network. RIP doesn't factor congestion into its routing decisions, while PAMR does.</p>
-                <img src="traffic_distribution_comparison_rip.png" alt="Traffic Distribution Comparison">
-            </div>
-            
-            <div class="comparison-section">
-                <h2>Specific Path Comparisons</h2>
-                <p>Detailed comparison of specific paths between selected source-destination pairs.</p>
-                
-                {
-                    ''.join([
-                        f"""
-                        <div class="path-comparison">
-                            <h3>Source {src} to Destination {dst}</h3>
-                            <p>PAMR Path Quality: {data['pamr_quality']:.3f}</p>
-                            <p>RIP Path Quality: {data['rip_quality']:.3f}</p>
-                            <p>Quality Improvement: {((data['pamr_quality'] - data['rip_quality']) / data['rip_quality'] * 100):.2f}%</p>
-                            <img src="pamr_vs_rip_path_{src}_to_{dst}.png" alt="Path Comparison">
-                        </div>
-                        """
-                        for (src, dst), data in path_comparisons.items()
-                    ])
-                }
-            </div>
-            
-            <div class="comparison-section">
-                <h2>RIP Routing Characteristics</h2>
-                <p>
-                    <strong>RIP (Routing Information Protocol)</strong> is one of the oldest routing protocols, with these key characteristics:
-                </p>
-                <ul>
-                    <li><strong>Distance Vector Protocol:</strong> Relies on the Bellman-Ford algorithm where routers exchange their distance vectors with neighbors</li>
-                    <li><strong>Hop Count Metric:</strong> Traditional RIP uses hop count as its primary metric, with a maximum of 15 hops (16 = infinity)</li>
-                    <li><strong>Simple Implementation:</strong> Easier to configure than link-state protocols like OSPF</li>
-                    <li><strong>Slow Convergence:</strong> Uses periodic updates and techniques like split horizon and poison reverse to avoid routing loops</li>
-                    <li><strong>Limited Scalability:</strong> Best suited for small networks due to hop count limitations</li>
-                </ul>
-            </div>
-            
-            <div class="comparison-section">
-                <h2>PAMR vs RIP: Key Differences</h2>
-                <table>
-                    <tr>
-                        <th>Feature</th>
-                        <th>PAMR</th>
-                        <th>RIP</th>
-                    </tr>
-                    <tr>
-                        <td>Routing Approach</td>
-                        <td>Pheromone-based adaptive routing</td>
-                        <td>Distance vector (Bellman-Ford)</td>
-                    </tr>
-                    <tr>
-                        <td>Metrics Considered</td>
-                        <td>Multiple (distance, congestion, bandwidth)</td>
-                        <td>Primarily hop count (or bandwidth in RIPv2)</td>
-                    </tr>
-                    <tr>
-                        <td>Adaptability</td>
-                        <td>Highly adaptable to changing conditions</td>
-                        <td>Limited adaptability via periodic updates</td>
-                    </tr>
-                    <tr>
-                        <td>Convergence Speed</td>
-                        <td>Faster convergence in dynamic conditions</td>
-                        <td>Slower convergence (counting to infinity problem)</td>
-                    </tr>
-                    <tr>
-                        <td>Scalability</td>
-                        <td>Scales to larger networks</td>
-                        <td>Limited to small networks (15 hop limit)</td>
-                    </tr>
-                </table>
-            </div>
-            
-            <div class="comparison-section">
-                <h2>Conclusion</h2>
-                <p>
-                    Based on the comparison results, PAMR routing demonstrates
-                    {
-                        'superior' 
-                        if (
-                            sum(pamr_metrics['path_qualities']) / len(pamr_metrics['path_qualities']) > 
-                            sum(rip_metrics['path_qualities']) / len(rip_metrics['path_qualities'])
-                        ) 
-                        else 'comparable'
-                    } 
-                    path quality compared to traditional RIP routing.
-                    
-                    {
-                        'PAMR also achieves faster convergence times, which is a significant advantage over RIP, which suffers from slow convergence especially in dynamic conditions.'
-                        if (
-                            sum(pamr_metrics['convergence_times']) / len(pamr_metrics['convergence_times']) < 
-                            sum(rip_metrics['convergence_times']) / len(rip_metrics['convergence_times'])
-                        )
-                        else 'RIP achieves faster convergence times in this simulation, which is surprising given its known limitations.'
-                    }
-                    
-                    {
-                        'Additionally, PAMR shows better traffic distribution across the network, resulting in lower overall congestion. This is expected as RIP does not consider congestion in its routing decisions.'
-                        if (
-                            sum(pamr_metrics['congestion_levels']) / len(pamr_metrics['congestion_levels']) < 
-                            sum(rip_metrics['congestion_levels']) / len(rip_metrics['congestion_levels'])
-                        )
-                        else 'Surprisingly, RIP shows better traffic distribution in this simulation, despite not directly considering congestion in its routing decisions.'
-                    }
-                </p>
-            </div>
-        </body>
-        </html>
-        """)
-    
-    return report_path
+    # Skip HTML report generation
+    print("Skipping HTML report generation - visualizations saved as PNG files")
 
 
 def main():
@@ -773,14 +728,13 @@ def main():
     # Run the comparison
     comparison_results = run_comparison(**params)
     
-    # Visualize the results
+    # Visualize the results - but disable HTML report generation
     output_dir = "./comparison_results"
-    report_path = visualize_comparison(comparison_results, output_dir)
     
-    # Open the report in a browser
-    print(f"Opening comparison report at: {report_path}")
-    webbrowser.open(f'file://{os.path.abspath(report_path)}', new=2)
+    # Modified to not generate HTML report
+    visualize_comparison(comparison_results, output_dir)
     
+    print(f"\nComparison visualizations saved to: {os.path.abspath(output_dir)}")
     print("Comparison completed successfully!")
 
 

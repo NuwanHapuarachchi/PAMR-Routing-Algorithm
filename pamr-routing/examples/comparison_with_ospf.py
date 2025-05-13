@@ -9,14 +9,13 @@ from collections import defaultdict
 import random
 import time
 from datetime import datetime
-import webbrowser
 
 # Add parent directory to path so we can import the pamr package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import from pamr package
 from pamr.core.network import NetworkTopology
-from pamr.core.routing import PAMRRouter
+from pamr.core.routing import PAMRRouter, OSPFRouter
 from pamr.simulation.simulator import PAMRSimulator
 from pamr.visualization.network_viz import NetworkVisualizer
 
@@ -231,12 +230,64 @@ def run_comparison(num_nodes=25, connectivity=0.3, num_iterations=150, packets_p
         pamr_path, pamr_quality = pamr_router.find_path(src, dst)
         ospf_path, ospf_quality = ospf_router.find_path(src, dst)
         
-        path_comparisons[(src, dst)] = {
-            'pamr_path': pamr_path,
-            'ospf_path': ospf_path,
-            'pamr_quality': pamr_quality,
-            'ospf_quality': ospf_quality
-        }
+        # Calculate comprehensive metrics for both paths
+        if pamr_path and ospf_path:
+            pamr_max_congestion = 0
+            pamr_avg_congestion = 0
+            pamr_total_pheromone = 0
+            
+            ospf_max_congestion = 0
+            ospf_avg_congestion = 0
+            ospf_total_pheromone = 0
+            
+            # Calculate PAMR path metrics
+            for i in range(len(pamr_path) - 1):
+                u, v = pamr_path[i], pamr_path[i+1]
+                pamr_max_congestion = max(pamr_max_congestion, pamr_router.graph[u][v].get('congestion', 0))
+                pamr_avg_congestion += pamr_router.graph[u][v].get('congestion', 0)
+                pamr_total_pheromone += pamr_router.pheromone_table[u].get(v, 0)
+            
+            # Calculate OSPF path metrics
+            for i in range(len(ospf_path) - 1):
+                u, v = ospf_path[i], ospf_path[i+1]
+                ospf_max_congestion = max(ospf_max_congestion, ospf_router.graph[u][v].get('congestion', 0))
+                ospf_avg_congestion += ospf_router.graph[u][v].get('congestion', 0)
+                # OSPF doesn't use pheromones, but we'll use an inverse of OSPF cost as an equivalent
+                cost = ospf_router._ospf_link_cost(u, v, ospf_router.graph[u][v])
+                ospf_total_pheromone += (100.0 / max(cost, 0.1))  # Normalize to similar scale as pheromones
+            
+            pamr_avg_congestion = pamr_avg_congestion / (len(pamr_path) - 1) if len(pamr_path) > 1 else 0
+            ospf_avg_congestion = ospf_avg_congestion / (len(ospf_path) - 1) if len(ospf_path) > 1 else 0
+            pamr_avg_pheromone = pamr_total_pheromone / (len(pamr_path) - 1) if len(pamr_path) > 1 else 0
+            ospf_avg_pheromone = ospf_total_pheromone / (len(ospf_path) - 1) if len(ospf_path) > 1 else 0
+            
+            path_comparisons[(src, dst)] = {
+                'pamr_path': pamr_path,
+                'ospf_path': ospf_path,
+                'pamr_quality': pamr_quality,
+                'ospf_quality': ospf_quality,
+                'pamr_length': len(pamr_path) - 1,
+                'ospf_length': len(ospf_path) - 1,
+                'pamr_max_congestion': pamr_max_congestion,
+                'ospf_max_congestion': ospf_max_congestion,
+                'pamr_avg_congestion': pamr_avg_congestion,
+                'ospf_avg_congestion': ospf_avg_congestion,
+                'pamr_avg_pheromone': pamr_avg_pheromone,
+                'ospf_avg_pheromone': ospf_avg_pheromone
+            }
+            
+            # Print detailed comparison for this source-destination pair
+            print(f"\nPath comparison from Node {src} to Node {dst}:")
+            print(f"  PAMR Path: {pamr_path}")
+            print(f"  OSPF Path: {ospf_path}")
+            print(f"  Metrics:")
+            print(f"    {'Metric':<20} {'PAMR':<15} {'OSPF':<15} {'Difference (%)':<15}")
+            print(f"    {'-' * 65}")
+            print(f"    {'Path Quality':<20} {pamr_quality:<15.4f} {ospf_quality:<15.4f} {((pamr_quality - ospf_quality) / max(0.0001, ospf_quality) * 100):<15.2f}")
+            print(f"    {'Path Length':<20} {len(pamr_path) - 1:<15d} {len(ospf_path) - 1:<15d} {((len(pamr_path) - len(ospf_path)) / max(1, len(ospf_path) - 1) * 100):<15.2f}")
+            print(f"    {'Max Congestion':<20} {pamr_max_congestion:<15.4f} {ospf_max_congestion:<15.4f} {((pamr_max_congestion - ospf_max_congestion) / max(0.0001, ospf_max_congestion) * 100):<15.2f}")
+            print(f"    {'Avg Congestion':<20} {pamr_avg_congestion:<15.4f} {ospf_avg_congestion:<15.4f} {((pamr_avg_congestion - ospf_avg_congestion) / max(0.0001, ospf_avg_congestion) * 100):<15.2f}")
+            print(f"    {'Avg Pheromone/Cost':<20} {pamr_avg_pheromone:<15.4f} {ospf_avg_pheromone:<15.4f} {((pamr_avg_pheromone - ospf_avg_pheromone) / max(0.0001, ospf_avg_pheromone) * 100):<15.2f}")
     
     # Collect comparison results
     comparison_results = {
@@ -259,10 +310,7 @@ def visualize_comparison(comparison_results, output_dir):
     
     Args:
         comparison_results: Dictionary of comparison results from run_comparison()
-        output_dir: Directory to save visualizations and report
-        
-    Returns:
-        Path to the generated report HTML file
+        output_dir: Directory to save visualizations
     """
     import os
     from datetime import datetime
@@ -452,125 +500,83 @@ def visualize_comparison(comparison_results, output_dir):
         path_viz_file = os.path.join(output_dir, f"ospf_vs_pamr_ml_path_{src}_to_{dst}.png")
         plt.savefig(path_viz_file, bbox_inches='tight')
         plt.close()
+        
+        # NEW: Create a bar chart comparing all metrics side by side
+        plt.figure(figsize=(14, 8))
+        
+        # Metrics to compare
+        metrics = [
+            ('Path Quality', data['pamr_quality'], data['ospf_quality'], 'Higher is better', 'Blues'),
+            ('Path Length (Hops)', data['pamr_length'], data['ospf_length'], 'Lower is better', 'Oranges'),
+            ('Max Congestion', data['pamr_max_congestion'], data['ospf_max_congestion'], 'Lower is better', 'Reds'),
+            ('Avg Congestion', data['pamr_avg_congestion'], data['ospf_avg_congestion'], 'Lower is better', 'Reds'),
+            ('Pheromone/Cost', data['pamr_avg_pheromone'], data['ospf_avg_pheromone'], 'Higher is better', 'Greens')
+        ]
+        
+        # Prepare plot
+        labels = [m[0] for m in metrics]
+        pamr_values = [m[1] for m in metrics]
+        ospf_values = [m[2] for m in metrics]
+        x = np.arange(len(labels))
+        width = 0.35
+        
+        # Create bars
+        fig, ax = plt.subplots(figsize=(14, 8))
+        rects1 = ax.bar(x - width/2, pamr_values, width, label='PAMR', color='#3498db', alpha=0.8)
+        rects2 = ax.bar(x + width/2, ospf_values, width, label='OSPF', color='#e74c3c', alpha=0.8)
+        
+        # Add labels and title
+        ax.set_title(f"Metrics Comparison for Path from Node {src} to Node {dst}", fontsize=16, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=0, fontsize=12)
+        ax.legend(fontsize=12)
+        
+        # Add value annotations on top of each bar
+        def autolabel(rects):
+            for rect in rects:
+                height = rect.get_height()
+                ax.annotate(f"{height:.4f}",
+                            xy=(rect.get_x() + rect.get_width()/2, height),
+                            xytext=(0, 3),
+                            textcoords="offset points",
+                            ha='center', va='bottom',
+                            fontsize=10, fontweight='bold')
+                
+        autolabel(rects1)
+        autolabel(rects2)
+        
+        # Add a note for each metric indicating what's better
+        for i, (_, _, _, note, _) in enumerate(metrics):
+            ax.annotate(note, xy=(i, 0), xytext=(i, -0.05*max(pamr_values+ospf_values)),
+                        textcoords="data", ha='center', va='top',
+                        fontsize=10, style='italic', color='gray')
+        
+        # Add percentage difference labels
+        for i, (metric, pamr_val, ospf_val, _, _) in enumerate(metrics):
+            if ospf_val > 0:
+                pct_diff = ((pamr_val - ospf_val) / ospf_val) * 100
+                color = 'green' if (pct_diff > 0 and (metric == 'Path Quality' or metric == 'Pheromone/Cost')) or \
+                                   (pct_diff < 0 and (metric == 'Path Length (Hops)' or 'Congestion' in metric)) else 'red'
+                
+                ax.annotate(f"{pct_diff:+.1f}%", 
+                            xy=((x[i] - width/2 + x[i] + width/2)/2, max(pamr_val, ospf_val)),
+                            xytext=(0, 10),
+                            textcoords="offset points",
+                            ha='center', va='bottom',
+                            fontsize=11, fontweight='bold', color=color)
+        
+        # Improve layout
+        plt.tight_layout()
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Save the comparison chart
+        metrics_file = os.path.join(output_dir, f"pamr_vs_ospf_metrics_{src}_to_{dst}.png")
+        plt.savefig(metrics_file, bbox_inches='tight', dpi=300)
+        plt.close()
     
-    # Generate HTML report
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_filename = f"pamr_vs_ospf_comparison_{timestamp}.html"
-    report_path = os.path.join(output_dir, report_filename)
+    # Skip HTML report generation
+    print("Skipping HTML report generation - visualizations saved as PNG files")
     
-    with open(report_path, 'w') as f:
-        f.write(f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>PAMR vs OSPF Comparison Report</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                h1 {{ color: #2c3e50; }}
-                h2 {{ color: #3498db; }}
-                img {{ max-width: 100%; }}
-                .comparison-section {{ margin-top: 30px; }}
-                .path-comparison {{ margin-top: 20px; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
-                th {{ background-color: #f2f2f2; }}
-            </style>
-        </head>
-        <body>
-            <h1>PAMR vs OSPF Routing Comparison Report</h1>
-            <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-            
-            <h2>Simulation Parameters</h2>
-            <table>
-                <tr><th>Parameter</th><th>Value</th></tr>
-                <tr><td>Number of Nodes</td><td>{params['num_nodes']}</td></tr>
-                <tr><td>Network Connectivity</td><td>{params['connectivity']}</td></tr>
-                <tr><td>Number of Iterations</td><td>{params['num_iterations']}</td></tr>
-                <tr><td>Packets per Iteration</td><td>{params['packets_per_iter']}</td></tr>
-            </table>
-            
-            <div class="comparison-section">
-                <h2>Network Topology</h2>
-                <p>The following image shows the pure network topology used in this simulation.</p>
-                <img src="network_topology_ospf_comparison.png" alt="Network Topology">
-            </div>
-            
-            <div class="comparison-section">
-                <h2>Overall Performance Metrics</h2>
-                
-                <h3>Convergence Time</h3>
-                <p>This graph shows how quickly each routing algorithm converges to a stable path.</p>
-                <img src="convergence_time_comparison.png" alt="Convergence Time Comparison">
-                
-                <h3>Path Quality</h3>
-                <p>This graph compares the quality of paths selected by each routing algorithm.</p>
-                <img src="path_quality_comparison.png" alt="Path Quality Comparison">
-                
-                <h3>Traffic Distribution</h3>
-                <p>This graph shows how traffic is distributed across the network.</p>
-                <img src="traffic_distribution_comparison.png" alt="Traffic Distribution Comparison">
-            </div>
-            
-            <div class="comparison-section">
-                <h2>Specific Path Comparisons</h2>
-                <p>Detailed comparison of specific paths between selected source-destination pairs.</p>
-                
-                {
-                    ''.join([
-                        f"""
-                        <div class="path-comparison">
-                            <h3>Source {src} to Destination {dst}</h3>
-                            <p>PAMR Path Quality: {data['pamr_quality']:.3f}</p>
-                            <p>OSPF Path Quality: {data['ospf_quality']:.3f}</p>
-                            <p>Quality Improvement: {((data['pamr_quality'] - data['ospf_quality']) / data['ospf_quality'] * 100):.2f}%</p>
-                            <img src="ospf_vs_pamr_ml_path_{src}_to_{dst}.png" alt="Path Comparison">
-                        </div>
-                        """
-                        for (src, dst), data in path_comparisons.items()
-                    ])
-                }
-            </div>
-            
-            <div class="comparison-section">
-                <h2>Conclusion</h2>
-                <p>
-                    Based on the comparison results, PAMR routing demonstrates
-                    {
-                        'superior' 
-                        if (
-                            sum(pamr_metrics['path_qualities']) / len(pamr_metrics['path_qualities']) > 
-                            sum(ospf_metrics['path_qualities']) / len(ospf_metrics['path_qualities'])
-                        ) 
-                        else 'comparable'
-                    } 
-                    path quality compared to traditional OSPF routing.
-                    
-                    {
-                        'PAMR also achieves faster convergence times, which can be critical in dynamic network conditions.'
-                        if (
-                            sum(pamr_metrics['convergence_times']) / len(pamr_metrics['convergence_times']) < 
-                            sum(ospf_metrics['convergence_times']) / len(ospf_metrics['convergence_times'])
-                        )
-                        else 'OSPF achieves faster convergence times in this simulation.'
-                    }
-                    
-                    {
-                        'Additionally, PAMR shows better traffic distribution across the network, resulting in lower overall congestion.'
-                        if (
-                            sum(pamr_metrics['congestion_levels']) / len(pamr_metrics['congestion_levels']) < 
-                            sum(ospf_metrics['congestion_levels']) / len(ospf_metrics['congestion_levels'])
-                        )
-                        else 'OSPF shows better traffic distribution in this simulation.'
-                    }
-                </p>
-            </div>
-        </body>
-        </html>
-        """)
-    
-    return report_path
-
-
 def main():
     """Main function to run the comparison."""
     # Define simulation parameters
@@ -586,14 +592,11 @@ def main():
     # Run the comparison
     comparison_results = run_comparison(**params)
     
-    # Visualize the results
+    # Visualize the results - no HTML report
     output_dir = "./comparison_results"
-    report_path = visualize_comparison(comparison_results, output_dir)
+    visualize_comparison(comparison_results, output_dir)
     
-    # Open the report in a browser
-    print(f"Opening comparison report at: {report_path}")
-    webbrowser.open(f'file://{os.path.abspath(report_path)}', new=2)
-    
+    print(f"\nComparison visualizations saved to: {os.path.abspath(output_dir)}")
     print("Comparison completed successfully!")
 
 

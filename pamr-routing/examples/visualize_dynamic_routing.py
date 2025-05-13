@@ -143,7 +143,8 @@ class RoutingVisualizer:
             'congestion_levels': [],
             'pheromone_levels': [],
             'paths_taken': [],
-            'active_paths': {}
+            'active_paths': {},
+            'path_pheromones': {}  # Initialize the path_pheromones dictionary here
         }
         
         # For animation
@@ -513,11 +514,11 @@ class RoutingVisualizer:
         """Create visualizations of the routing metrics"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # Create plots for different metrics
-        plt.figure(figsize=(12, 8))
+        # Create a larger figure to accommodate the additional plot
+        plt.figure(figsize=(16, 12))
         
         # 1. Path Quality Over Time
-        plt.subplot(2, 2, 1)
+        plt.subplot(2, 3, 1)
         plt.plot(self.metrics['iterations'], self.metrics['path_quality'], 'b-', linewidth=2)
         plt.title('Path Quality Over Time')
         plt.xlabel('Packet Number')
@@ -525,38 +526,274 @@ class RoutingVisualizer:
         plt.grid(True)
         
         # 2. Congestion Levels Over Time
-        plt.subplot(2, 2, 2)
+        plt.subplot(2, 3, 2)
         plt.plot(self.metrics['iterations'], self.metrics['congestion_levels'], 'r-', linewidth=2)
         plt.title('Max Congestion Over Time')
         plt.xlabel('Packet Number')
         plt.ylabel('Max Congestion')
         plt.grid(True)
         
-        # 3. Pheromone Levels Over Time
-        plt.subplot(2, 2, 3)
-        plt.plot(self.metrics['iterations'], self.metrics['pheromone_levels'], 'g-', linewidth=2)
-        plt.title('Average Pheromone Level Over Time')
-        plt.xlabel('Packet Number')
-        plt.ylabel('Avg Pheromone')
-        plt.grid(True)
-        
-        # 4. Path Length Over Time
-        plt.subplot(2, 2, 4)
+        # 3. Path Length Over Time
+        plt.subplot(2, 3, 3)
         plt.plot(self.metrics['iterations'], self.metrics['path_lengths'], 'purple', linewidth=2)
         plt.title('Path Length Over Time')
         plt.xlabel('Packet Number')
         plt.ylabel('Number of Hops')
         plt.grid(True)
         
+        # Path-specific pheromone levels (span the entire bottom row for better visibility)
+        ax_pheromones = plt.subplot(2, 3, (4, 6))  # Span all three columns
+        
+        if 'path_pheromones' in self.metrics and self.metrics['path_pheromones']:
+            # Get color cycle for different paths
+            colors = plt.cm.tab10.colors
+            markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+            
+            # Create a full x-axis range for all iterations
+            all_iterations = self.metrics['iterations']
+            
+            # Plot each path's pheromone levels as separate lines
+            for i, (path_str, pheromone_values) in enumerate(self.metrics['path_pheromones'].items()):
+                # Fill missing values with NaN for cleaner plotting
+                full_values = []
+                for j, iter_num in enumerate(all_iterations):
+                    if j < len(pheromone_values) and pheromone_values[j] is not None:
+                        full_values.append(pheromone_values[j])
+                    else:
+                        full_values.append(float('nan'))
+                
+                # Choose color and marker for this path
+                color = colors[i % len(colors)]
+                marker = markers[i % len(markers)]
+                
+                # Count path usage for the legend
+                usage_count = self.metrics['paths_taken'].count([int(n) for n in path_str.split('->')])
+                
+                # Plot with a continuous line connecting only the valid points
+                mask = ~np.isnan(np.array(full_values))
+                
+                if any(mask):  # Only plot if we have valid data points
+                    # Plot line with markers at data points
+                    ax_pheromones.plot(
+                        np.array(all_iterations)[mask], 
+                        np.array(full_values)[mask], 
+                        marker=marker, 
+                        markersize=8,  # Slightly larger markers for better visibility
+                        markevery=max(1, len(all_iterations)//15),  # Show markers at regular intervals
+                        linestyle='-', 
+                        linewidth=2.5,  # Slightly thicker lines
+                        color=color, 
+                        alpha=0.9,
+                        label=f"Path {path_str[:25]}{'...' if len(path_str) > 25 else ''} ({usage_count})"
+                    )
+            
+            # Add horizontal line at initial pheromone level (0.5)
+            ax_pheromones.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Initial level')
+            
+            # Set y-axis to start from 0 (or slightly below for visibility)
+            y_min = max(0, min([min([v for v in vals if v is not None] or [0]) 
+                           for vals in self.metrics['path_pheromones'].values()] or [0]) - 0.05)
+            y_max = max([max([v for v in vals if v is not None] or [0]) 
+                         for vals in self.metrics['path_pheromones'].values()] or [0]) + 0.1
+            
+            ax_pheromones.set_ylim(y_min, y_max)
+            
+            # Add grid lines
+            ax_pheromones.grid(True, linestyle='--', alpha=0.7)
+            
+            # Add legend with path information - better positioning with more space
+            ax_pheromones.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize='small')
+        
+        ax_pheromones.set_title('Pheromone Levels By Path')
+        ax_pheromones.set_xlabel('Packet Number')
+        ax_pheromones.set_ylabel('Pheromone Level')
+        
         plt.tight_layout()
+        plt.subplots_adjust(bottom=0.2)  # Make room for the legend at the bottom
         metrics_path = os.path.join(output_dir, 'routing_metrics.png')
-        plt.savefig(metrics_path)
+        plt.savefig(metrics_path, dpi=150, bbox_inches='tight')
         plt.close()
         
         # Create a visualization of all paths taken between the source and destination
         self.visualize_path_changes(output_dir)
         
+        # Still create a separate, more detailed pheromone visualization
+        if 'path_pheromones' in self.metrics and self.metrics['path_pheromones']:
+            path_pheromone_path = self.visualize_path_pheromones(output_dir)
+            print(f"Detailed path-specific pheromone visualization saved to: {path_pheromone_path}")
+        
         return metrics_path
+    
+    def visualize_path_pheromones(self, output_dir):
+        """Create a separate visualization showing pheromone levels for each unique path"""
+        if 'path_pheromones' not in self.metrics or not self.metrics['path_pheromones']:
+            return
+            
+        # Create a new figure for path-specific pheromone levels
+        plt.figure(figsize=(16, 10))
+        
+        # Get color cycle for different paths
+        colors = plt.cm.tab10.colors
+        markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+        
+        # Create a full x-axis range for all iterations
+        all_iterations = self.metrics['iterations']
+        
+        # Track legend entries
+        legend_entries = []
+        
+        # Create a separate subplot for a clearer comparison
+        ax = plt.subplot(111)
+        
+        # Add a light gray grid
+        ax.grid(True, linestyle='--', alpha=0.7)
+        
+        # Plot each path's pheromone levels as separate lines
+        for i, (path_str, pheromone_values) in enumerate(self.metrics['path_pheromones'].items()):
+            # Fill missing values with NaN for cleaner plotting
+            full_values = []
+            for j, iter_num in enumerate(all_iterations):
+                if j < len(pheromone_values) and pheromone_values[j] is not None:
+                    full_values.append(pheromone_values[j])
+                else:
+                    full_values.append(float('nan'))
+            
+            # Choose color and marker for this path
+            color = colors[i % len(colors)]
+            marker = markers[i % len(markers)]
+            
+            # Count path usage for the legend
+            usage_count = self.metrics['paths_taken'].count([int(n) for n in path_str.split('->')])
+            
+            # Plot with a continuous line connecting only the valid points
+            mask = ~np.isnan(full_values)
+            
+            if any(mask):  # Only plot if we have valid data points
+                # Plot line with markers at data points
+                line, = ax.plot(
+                    np.array(all_iterations)[mask], 
+                    np.array(full_values)[mask], 
+                    marker=marker, 
+                    markersize=8,
+                    markevery=max(1, len(all_iterations)//20),  # Show markers at regular intervals
+                    linestyle='-', 
+                    linewidth=2.5, 
+                    color=color, 
+                    alpha=0.9,
+                    label=f"Path {path_str} (used {usage_count} times)"
+                )
+                legend_entries.append(line)
+                
+                # Annotate the final pheromone value
+                last_valid_idx = np.where(mask)[0][-1]
+                ax.annotate(
+                    f"{full_values[last_valid_idx]:.3f}",
+                    xy=(all_iterations[last_valid_idx], full_values[last_valid_idx]),
+                    xytext=(5, 0),
+                    textcoords='offset points',
+                    fontsize=9,
+                    fontweight='bold',
+                    color=color,
+                    backgroundcolor='white',
+                    alpha=0.8
+                )
+        
+        # Add labels and title
+        ax.set_title('Pheromone Levels By Path Over Iterations', fontsize=16, fontweight='bold')
+        ax.set_xlabel('Iteration Number', fontsize=14)
+        ax.set_ylabel('Average Pheromone Level', fontsize=14)
+        
+        # Set y-axis to start from 0 (or slightly below for visibility)
+        y_min = max(0, min([min([v for v in vals if v is not None] or [0]) 
+                       for vals in self.metrics['path_pheromones'].values()] or [0]) - 0.05)
+        y_max = max([max([v for v in vals if v is not None] or [0]) 
+                     for vals in self.metrics['path_pheromones'].values()] or [0]) + 0.1
+        
+        ax.set_ylim(y_min, y_max)
+        
+        # Add horizontal line at initial pheromone level (0.5)
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Initial pheromone level')
+        
+        # Add legend with path information in two columns
+        if legend_entries:
+            ax.legend(
+                handles=legend_entries + [plt.Line2D([0], [0], color='gray', linestyle='--', alpha=0.5)], 
+                loc='upper center', 
+                bbox_to_anchor=(0.5, -0.1),
+                ncol=2, 
+                fontsize=12,
+                frameon=True,
+                shadow=True
+            )
+            
+        # Adjust layout to make room for the legend
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.2)
+        
+        # Save the figure with high DPI for better quality
+        pheromone_path = os.path.join(output_dir, 'path_pheromone_levels.png')
+        plt.savefig(pheromone_path, bbox_inches='tight', dpi=300)
+        plt.close()
+        
+        # Also save an interactive HTML version that allows zooming
+        try:
+            import plotly.express as px
+            import plotly.graph_objects as go
+            import pandas as pd
+            
+            # Create a DataFrame for Plotly
+            df_data = []
+            for path_str, pheromone_values in self.metrics['path_pheromones'].items():
+                for iter_idx, pheromone in enumerate(pheromone_values):
+                    if pheromone is not None:
+                        df_data.append({
+                            'Iteration': iter_idx + 1,
+                            'Pheromone': pheromone,
+                            'Path': path_str
+                        })
+            
+            if df_data:
+                df = pd.DataFrame(df_data)
+                
+                # Create interactive plot
+                fig = px.line(
+                    df, 
+                    x='Iteration', 
+                    y='Pheromone', 
+                    color='Path',
+                    markers=True,
+                    title='Pheromone Levels By Path Over Iterations',
+                    labels={'Pheromone': 'Average Pheromone Level', 'Iteration': 'Iteration Number'}
+                )
+                
+                # Improve layout
+                fig.update_layout(
+                    legend_title_text='Path',
+                    hovermode='closest',
+                    xaxis=dict(title=dict(font=dict(size=14))),
+                    yaxis=dict(title=dict(font=dict(size=14))),
+                    title=dict(font=dict(size=16)),
+                )
+                
+                # Add reference line for initial pheromone
+                fig.add_shape(
+                    type="line",
+                    x0=0,
+                    y0=0.5,
+                    x1=df['Iteration'].max(),
+                    y1=0.5,
+                    line=dict(color="gray", width=2, dash="dash"),
+                )
+                
+                # Save as HTML
+                html_path = os.path.join(output_dir, 'interactive_pheromone_levels.html')
+                fig.write_html(html_path)
+                print(f"Interactive pheromone visualization saved to: {html_path}")
+        except ImportError:
+            # If plotly is not available, just continue with the static image
+            pass
+            
+        return pheromone_path
     
     def visualize_path_changes(self, output_dir):
         """Create a visualization showing how paths changed over time"""
@@ -675,6 +912,24 @@ class RoutingVisualizer:
         # Path cache to store discovered paths between source and destination
         path_cache = []
         
+        # Initialize the path_pheromones dictionary if it doesn't exist
+        if 'path_pheromones' not in self.metrics:
+            self.metrics['path_pheromones'] = {}
+        
+        # Track path iterations for each unique path
+        path_iterations = {}
+        
+        # Set parameters for dynamic pheromone updates - ADJUSTED FOR BETTER BALANCE
+        pheromone_reward = 0.13        # INCREASED: Amount to increase pheromone on successful paths
+        pheromone_evaporation = 0.05  # REDUCED: Rate at which pheromones evaporate each iteration
+        congestion_penalty = 0.2      # How much congestion reduces pheromone reinforcement
+        min_pheromone = 0.1           # Minimum pheromone level to prevent complete evaporation
+        max_pheromone = 2.0           # Maximum pheromone level to prevent runaway values
+        
+        # Print header for pheromone tracking in terminal
+        print("\n{:<5} {:<40} {:<15}".format("Packet", "Path", "Avg Pheromone"))
+        print("-" * 65)
+        
         for i in range(num_packets):
             # Get multiple paths with distribution ratios
             path_options = self.router.get_multi_path_routing(source, destination)
@@ -722,7 +977,7 @@ class RoutingVisualizer:
                             alt_path_max_congestion = max(alt_path_max_congestion, 
                                                      self.network.graph[u][v].get('congestion', 0))
                                                       
-                        print(f"    Path: {alt_path_str} | Quality: {alt_path_quality:.4f} | Max Congestion: {alt_path_max_congestion:.4f}")
+                        print(f"    Path: {alt_path_str} | Quality: {alt_path_quality:.4f} | Max Congestion: {alt_path_max_congestion:.4f} | Traffic Share: {ratio:.2f}")
                 
             # Track this path for visualization
             if path_str not in path_distribution:
@@ -735,6 +990,15 @@ class RoutingVisualizer:
             # Update metrics for this path
             all_paths.append(path)
             all_qualities.append(quality)
+            
+            # IMPORTANT: Apply global pheromone evaporation to all edges
+            # This ensures pheromone levels change over time, even for paths that aren't used
+            # Only apply evaporation to edges not in the current or recent paths
+            for u in self.router.pheromone_table:
+                for v in self.router.pheromone_table[u]:
+                    # Evaporate pheromones on all edges
+                    current = self.router.pheromone_table[u][v]
+                    self.router.pheromone_table[u][v] = max(min_pheromone, current * (1 - pheromone_evaporation))
             
             # Update traffic on this path - only on the selected path, not on all paths
             for j in range(len(path)-1):
@@ -750,6 +1014,16 @@ class RoutingVisualizer:
                 
                 # Track max congestion
                 max_congestion = max(max_congestion, new_congestion)
+                
+                # IMPORTANT: Apply pheromone reinforcement to the selected path
+                # The amount of reinforcement is reduced by congestion but enhanced by path quality
+                congestion_factor = max(0, 1 - (new_congestion * congestion_penalty))
+                reinforcement = pheromone_reward * (quality + 0.5) * congestion_factor  # Added 0.5 to ensure positive reinforcement
+                
+                # Add reinforcement - using a formula that allows pheromone growth for good paths
+                current = self.router.pheromone_table[u].get(v, 0.5)
+                # Stronger reinforcement for good paths, especially at lower pheromone levels
+                self.router.pheromone_table[u][v] = min(max_pheromone, current + reinforcement)
             
             all_congestion.append(max_congestion)
             
@@ -763,7 +1037,58 @@ class RoutingVisualizer:
             self.metrics['path_lengths'].append(len(path)-1)
             self.metrics['congestion_levels'].append(max_congestion)
             
-            # Calculate avg pheromone on primary path
+            # Calculate and track pheromone levels for EACH path separately
+            path_pheromone_values = {}
+            
+            # Print pheromone levels for all paths in this iteration
+            print("\n{:<5} {:<40} {:<15} {:<10} {:<15} {:<15}".format(
+                f"#{i+1}", "Path", "Pheromone", "Quality", "Max Congestion", "Traffic Share"))
+            print("-" * 105)
+            
+            for idx, (p_option, traffic_share) in enumerate(path_options):
+                p_str = '->'.join([str(node) for node in p_option])
+                
+                # Initialize for new paths
+                if p_str not in self.metrics['path_pheromones']:
+                    self.metrics['path_pheromones'][p_str] = [None] * i  # Fill with None for previous iterations
+                    path_iterations[p_str] = []
+                
+                # Calculate average pheromone for this path
+                total_pheromone = 0
+                max_congestion = 0
+                for j in range(len(p_option)-1):
+                    u, v = p_option[j], p_option[j+1]
+                    total_pheromone += self.router.pheromone_table[u].get(v, 0)
+                    max_congestion = max(max_congestion, self.network.graph[u][v].get('congestion', 0))
+                
+                avg_pheromone = total_pheromone / (len(p_option)-1) if len(p_option) > 1 else 0
+                
+                # Calculate path quality
+                path_quality = self.router._calculate_path_quality(p_option)
+                
+                # Store in temporary dict for printing
+                path_pheromone_values[p_str] = avg_pheromone
+                
+                # Store pheromone value
+                self.metrics['path_pheromones'][p_str].append(avg_pheromone)
+                path_iterations[p_str].append(i+1)  # Store which iteration this path was considered
+                
+                # Print metrics for this path
+                is_selected = " *" if p_str == path_str else ""
+                print("{:<5} {:<40} {:<15.6f} {:<10.4f} {:<15.4f} {:<15.2f}{}".format(
+                    "", p_str, avg_pheromone, path_quality, max_congestion, traffic_share, is_selected))
+            
+            print("")  # Extra space for readability
+            
+            # Make sure all paths have the same number of entries
+            max_length = i + 1
+            for p_str in self.metrics['path_pheromones']:
+                current_length = len(self.metrics['path_pheromones'][p_str])
+                if current_length < max_length:
+                    # Add None for iterations where this path wasn't considered
+                    self.metrics['path_pheromones'][p_str].extend([None] * (max_length - current_length))
+            
+            # Also track the selected path's pheromone in the main metrics
             total_pheromone = 0
             for j in range(len(path)-1):
                 u, v = path[j], path[j+1]
@@ -792,6 +1117,36 @@ class RoutingVisualizer:
             # Call router's update
             self.router.update_iteration()
         
+        # Print summary of pheromone levels for each path at the end
+        print("\n=== FINAL PHEROMONE LEVELS BY PATH ===")
+        print("{:<40} {:<15} {:<10} {:<15} {:<15}".format(
+            "Path", "Final Pheromone", "Usage", "Quality", "Max Congestion"))
+        print("-" * 95)
+        
+        # Get all unique paths that have been used
+        all_path_strings = list(self.metrics['path_pheromones'].keys())
+        
+        # Calculate the final average pheromone for each path
+        for path_str in all_path_strings:
+            # Get the last non-None pheromone value
+            pheromone_values = [p for p in self.metrics['path_pheromones'][path_str] if p is not None]
+            if pheromone_values:
+                final_pheromone = pheromone_values[-1]
+                usage = path_distribution.get(path_str, 0)
+                
+                # Calculate final path quality and congestion
+                path_nodes = [int(n) for n in path_str.split('->')]
+                path_quality = self.router._calculate_path_quality(path_nodes)
+                
+                # Get max congestion for this path
+                max_congestion = 0
+                for j in range(len(path_nodes)-1):
+                    u, v = path_nodes[j], path_nodes[j+1]
+                    max_congestion = max(max_congestion, self.network.graph[u][v].get('congestion', 0))
+                
+                print("{:<40} {:<15.6f} {:<10} {:<15.4f} {:<15.4f}".format(
+                    path_str, final_pheromone, usage, path_quality, max_congestion))
+        
         # Calculate which paths were used most frequently
         sorted_paths = sorted(path_distribution.items(), key=lambda x: x[1], reverse=True)
         print("\nPath Usage Summary:")
@@ -811,64 +1166,70 @@ class RoutingVisualizer:
 
 def run_visualization_test():
     """Run a test of the Advanced Multi-Path routing visualization with sophisticated path discovery"""
-    # Create output directory
-    output_dir = './visualization_results'
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Import the singleton network from core.network
-    from pamr.core.network import network
-    
-    print("Creating advanced multi-path routing visualizer...")
-    
-    # Create the advanced multi-path router using the imported network
-    router = AdvancedMultiPathRouter(
-        network.graph, 
-        alpha=2.0,    # Pheromone importance
-        beta=3.0,     # Distance importance
-        gamma=15.0,   # Congestion importance - higher values avoid congestion more
-        adapt_weights=True
-    )
-    
-    # Create visualizer with advanced router
-    visualizer = RoutingVisualizer(
-        num_nodes=network.num_nodes, 
-        connectivity=network.connectivity, 
-        seed=network.seed, 
-        gamma=15.0
-    )
-    visualizer.router = router  # Replace default router with advanced router
-    visualizer.network = network  # Replace default network with the singleton network
-    
-    # Choose source and destination 
-    source = 2  
-    destination = 3  
-    
-    print(f"Selected source={source}, destination={destination}")
-    print(f"Using advanced multi-path router with up to {router.max_paths_to_discover} diverse paths")
-    print(f"Will simultaneously distribute traffic across up to {router.max_paths_to_use} paths")
-    
-    # Use advanced multi-path routing
-    visualizer.send_packets_multi_path(
-        source=source, 
-        destination=destination, 
-        num_packets=30,
-        visualize=True,
-        output_path=os.path.join(output_dir, 'routing_animation.png')
-    )
-    
-    # Create metric visualizations
-    metrics_path = visualizer.visualize_metrics(output_dir)
-    
-    # Open the metrics visualization
-    webbrowser.open(f"file:///{os.path.abspath(metrics_path)}")
-    
-    print("\nExperiment complete!")
-    print(f"Results available in: {os.path.abspath(output_dir)}")
-    
-    # Show path visualization
-    path_changes_file = os.path.join(output_dir, f'path_changes_{source}_to_{destination}.png')
-    if os.path.exists(path_changes_file):
-        webbrowser.open(f"file:///{os.path.abspath(path_changes_file)}")
+    try:
+        # Create output directory
+        output_dir = './visualization_results'
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Import the singleton network from core.network
+        from pamr.core.network import network
+        
+        print("Creating advanced multi-path routing visualizer...")
+        
+        # Create the advanced multi-path router using the imported network
+        router = AdvancedMultiPathRouter(
+            network.graph, 
+            alpha=2.0,    # Pheromone importance
+            beta=3.0,     # Distance importance
+            gamma=10.0,   # Congestion importance - higher values avoid congestion more
+            adapt_weights=True
+        )
+        
+        # Create visualizer with advanced router
+        visualizer = RoutingVisualizer(
+            num_nodes=network.num_nodes, 
+            connectivity=network.connectivity, 
+            seed=network.seed, 
+            gamma=10.0
+        )
+        visualizer.router = router  # Replace default router with advanced router
+        visualizer.network = network  # Replace default network with the singleton network
+        
+        # Choose source and destination 
+        source = 2  
+        destination = 3  
+        
+        print(f"Selected source={source}, destination={destination}")
+        print(f"Using advanced multi-path router with up to {router.max_paths_to_discover} diverse paths")
+        print(f"Will simultaneously distribute traffic across up to {router.max_paths_to_use} paths")
+        
+        # Use advanced multi-path routing with fewer packets for testing
+        visualizer.send_packets_multi_path(
+            source=source, 
+            destination=destination, 
+            num_packets=30,  # Restored to original value
+            visualize=True,
+            output_path=os.path.join(output_dir, 'routing_animation.png')
+        )
+        
+        # Create metric visualizations
+        metrics_path = visualizer.visualize_metrics(output_dir)
+        
+        # Open the metrics visualization
+        webbrowser.open(f"file:///{os.path.abspath(metrics_path)}")
+        
+        print("\nExperiment complete!")
+        print(f"Results available in: {os.path.abspath(output_dir)}")
+        
+        # Show path visualization
+        path_changes_file = os.path.join(output_dir, f'path_changes_{source}_to_{destination}.png')
+        if os.path.exists(path_changes_file):
+            webbrowser.open(f"file:///{os.path.abspath(path_changes_file)}")
+            
+    except Exception as e:
+        print(f"Error during visualization: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     run_visualization_test()

@@ -163,16 +163,20 @@ class NetworkTopology:
             network.save(filepath)
             return network
 
-# Debugging: Add print statements to confirm function execution
-print("Debug: Starting to print metrics for nodes 0 and 1")
-
 # Function to print metrics for specific source and destination nodes
 def print_metrics_for_nodes(network, source, destination, iterations=20):
-    print(f"Debug: Metrics for source node {source} and destination node {destination}:")
+    """Print network metrics for a specific edge over multiple iterations.
+    
+    Args:
+        network: NetworkTopology instance
+        source: Source node
+        destination: Destination node
+        iterations: Number of iterations to simulate
+    """
+    print(f"Metrics for source node {source} and destination node {destination}:")
     print("Iteration | Edge (u, v) | Distance | Capacity | Traffic | Congestion")
     print("-" * 70)
     for i in range(iterations):
-        print(f"Debug: Iteration {i+1}")  # Debugging iteration
         network.update_dynamic_metrics()
         for u, v in network.graph.edges():
             if u == source and v == destination:
@@ -182,18 +186,10 @@ def print_metrics_for_nodes(network, source, destination, iterations=20):
                 congestion = network.graph[u][v]['congestion']
                 print(f"{i+1:9} | ({u:2}, {v:2}) | {distance:8.2f} | {capacity:8.2f} | {traffic:7.2f} | {congestion:9.2f}")
 
-# Initialize consistent_network before using it
-consistent_network = NetworkTopology.get_consistent_network(
-    filepath="consistent_network.pkl",
-    force_new=True,  # Use existing network if available
-    num_nodes=15,  # Default number of nodes
-    connectivity=0.3,  # Default connectivity
-    seed=42,  # Default seed for reproducibility
-    variation_factor=0.5  # Default variation factor
+# Create a singleton network instance that can be reused across simulations
+network = NetworkTopology(
+    num_nodes=30,  # Default size
+    connectivity=0.2,
+    seed=42,  # For reproducible results
+    variation_factor=0.05
 )
-
-# Example usage for nodes 0 and 1
-print_metrics_for_nodes(consistent_network, source=0, destination=1)
-
-# For backward compatibility
-network = consistent_network

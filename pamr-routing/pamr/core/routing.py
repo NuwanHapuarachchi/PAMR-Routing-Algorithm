@@ -2,7 +2,7 @@ import random
 import numpy as np
 import networkx as nx
 import heapq
-from collections import defaultdict
+from collections import defaultdict, deque
 import os
 import pickle
 
@@ -10,83 +10,363 @@ class PAMRRouter:
     """Path selection and routing logic for PAMR protocol with advanced features."""
     
     def __init__(self, graph, alpha=2.0, beta=3.0, gamma=8.0, adapt_weights=True):
-        self.graph = graph
-        self.alpha = alpha  # Pheromone importance
-        self.beta = beta    # Distance importance
-        self.gamma = gamma  # Congestion importance
-        self.adapt_weights = adapt_weights  # Dynamically adapt weights
-        self.path_history = {}  # Track routing history
-        self.iteration = 0  # Track iterations
-        
-        # Advanced routing features
-        self.pheromone_table = defaultdict(dict)  # Enhanced pheromone table
-        self.routing_table = defaultdict(dict)    # Global routing table
-        self.link_state_db = {}                   # Link state database
-        self.path_cache = {}                      # Path cache for quick lookups
-        self.congestion_history = defaultdict(list)  # Track historical congestion
-        self.traffic_matrix = defaultdict(dict)      # Traffic matrix for prediction
-        
-        # Algorithm parameters
-        self.path_update_interval = 20   # Update core paths less frequently (was 5)
-        self.pheromone_evaporation = 0.95 # Slower pheromone evaporation (was 0.9)
-        self.local_search_depth = 2      # Reduced depth of local path improvement search (was 3)
-        self.load_balancing_threshold = 0.25  # Higher threshold to reduce alternative path computations (was 0.15)
-        self.quick_reroute_enabled = True     # Enable fast rerouting
-        self.use_advanced_cache = True        # Enable advanced caching
-        self.cache_ttl = 10                   # Time to live for cache entries
-        
-        # Multi-path routing support
-        self.multi_path_enabled = True        # Enable traffic distribution across multiple paths
-        self.path_alternatives = {}           # Store alternative paths for each source-dest pair
-        self.congestion_threshold = 0.4       # When to start considering alternative paths
-        self.min_path_share = 0.1             # Minimum traffic share for any path
-        
-        # Cache hit rate tracking
-        self.cache_hits = 0
-        self.cache_misses = 0
-        
-        # Initialize the routing system
-        self._initialize_routing()
+        try:
+            self.graph = graph
+            self.alpha = alpha  # Pheromone importance
+            self.beta = beta    # Distance importance
+            self.gamma = gamma  # Congestion importance
+            self.adapt_weights = adapt_weights  # Dynamically adapt weights
+            
+            # IMPROVEMENT: Use more memory-efficient data structures
+            # LRU (Least Recently Used) cache size limits to prevent unbounded growth
+            self.max_path_history_entries = 1000  # Maximum number of path history entries to store
+            self.max_history_per_path = 5        # Maximum history points per path
+            self.max_congestion_history_size = 20  # Maximum congestion history length
+            
+            # Primary data structures with bounded size
+            self.path_history = {}  # Track routing history (limited size)
+            self.iteration = 0  # Track iterations
+            
+            # Advanced routing features
+            self.pheromone_table = defaultdict(dict)  # Enhanced pheromone table
+            self.routing_table = defaultdict(dict)    # Global routing table
+            self.link_state_db = {}                   # Link state database
+            
+            # IMPROVEMENT: More efficient congestion history - use deque for O(1) append/pop
+            self.congestion_history = defaultdict(lambda: deque(maxlen=self.max_congestion_history_size))
+            
+            # IMPROVEMENT: LRU cache implementation for path cache
+            self.path_cache_size = 5000
+            self.path_cache = {}  # Will be converted to LRU cache
+            self.path_cache_keys = deque(maxlen=self.path_cache_size)  # Track LRU keys
+            
+            self.traffic_matrix = defaultdict(dict)  # Traffic matrix for prediction
+            
+            # Algorithm parameters
+            self.path_update_interval = 20   # Update core paths less frequently (was 5)
+            self.pheromone_evaporation = 0.95 # Slower pheromone evaporation (was 0.9)
+            self.local_search_depth = 2      # Reduced depth of local path improvement search (was 3)
+            self.load_balancing_threshold = 0.25  # Higher threshold to reduce alternative path computations (was 0.15)
+            self.quick_reroute_enabled = True     # Enable fast rerouting
+            self.use_advanced_cache = True        # Enable advanced caching
+            self.cache_ttl = 10                   # Time to live for cache entries
+            
+            # Multi-path routing support
+            self.multi_path_enabled = True        # Enable traffic distribution across multiple paths
+            self.path_alternatives = {}           # Store alternative paths for each source-dest pair
+            self.congestion_threshold = 0.4       # When to start considering alternative paths
+            self.min_path_share = 0.1             # Minimum traffic share for any path
+            
+            # Cache hit rate tracking
+            self.cache_hits = 0
+            self.cache_misses = 0
+            
+            # Error tracking
+            self.error_counter = defaultdict(int)  # Track error occurrences by type
+            self.last_error = None  # Store most recent error
+            self.consecutive_errors = 0  # Track consecutive errors
+            
+            # Initialize the routing system
+            self._initialize_routing()
+        except Exception as e:
+            # Properly handle initialization errors
+            self.last_error = f"Initialization error: {str(e)}"
+            self.error_counter["init_error"] += 1
+            # Re-raise with additional context
+            raise ValueError(f"Failed to initialize PAMRRouter: {str(e)}") from e
     
     def _initialize_routing(self):
         """Initialize the routing system with proactive discovery."""
-        # Initialize pheromone for all edges
-        for u, v, data in self.graph.edges(data=True):
-            self.pheromone_table[u][v] = 1.0
+        try:
+            # Initialize pheromone for all edges
+            for u, v, data in self.graph.edges(data=True):
+                self.pheromone_table[u][v] = 1.0
+                
+                # Initialize link state database with edge properties
+                if u not in self.link_state_db:
+                    self.link_state_db[u] = {}
+                self.link_state_db[u][v] = {
+                    'distance': data.get('distance', 1.0),
+                    'bandwidth': data.get('bandwidth', 1.0),
+                    'congestion': data.get('congestion', 0.0),
+                    'last_updated': 0
+                }
             
-            # Initialize link state database with edge properties
-            if u not in self.link_state_db:
-                self.link_state_db[u] = {}
-            self.link_state_db[u][v] = {
-                'distance': data.get('distance', 1.0),
-                'bandwidth': data.get('bandwidth', 1.0),
-                'congestion': data.get('congestion', 0.0),
-                'last_updated': 0
-            }
+            # Pre-compute initial routing tables
+            self._update_core_paths()
+        except nx.NetworkXError as e:
+            # Handle NetworkX specific errors
+            self.last_error = f"Network structure error during initialization: {str(e)}"
+            self.error_counter["networkx_error"] += 1
+            raise
+        except Exception as e:
+            # Handle general errors during initialization
+            self.last_error = f"General error during routing initialization: {str(e)}"
+            self.error_counter["init_routing_error"] += 1
+            raise ValueError(f"Failed to initialize routing system: {str(e)}") from e
+    
+    # Add a general error handling method
+    def _handle_error(self, error, error_type="general", critical=False, context=None):
+        """
+        Handle errors consistently throughout the router.
         
-        # Pre-compute initial routing tables
-        self._update_core_paths()
+        Args:
+            error: The exception object
+            error_type: Category of error for tracking
+            critical: Whether this is a critical error requiring immediate attention
+            context: Additional context about where the error occurred
+            
+        Returns:
+            True if the error was handled, False if it should be re-raised
+        """
+        self.error_counter[error_type] += 1
+        self.consecutive_errors += 1
+        
+        # Format error message with context
+        error_msg = f"{error_type} error"
+        if context:
+            error_msg += f" in {context}"
+        error_msg += f": {str(error)}"
+        
+        self.last_error = error_msg
+        
+        # Check for repeated errors
+        if self.error_counter[error_type] > 10:
+            # Log that this error is happening frequently
+            print(f"Warning: {error_type} error occurring frequently ({self.error_counter[error_type]} times)")
+            
+        # If too many consecutive errors, something is seriously wrong
+        if self.consecutive_errors > 100:
+            print("Critical: Too many consecutive errors, router may be in a bad state")
+            return False  # Suggest re-raising
+            
+        # For critical errors, don't handle - let them propagate
+        if critical:
+            return False
+            
+        return True  # Error was handled
+    
+    def _find_min_loss_path(self, source, destination):
+        """Find path with minimum packet loss probability."""
+        try:
+            # Create a weight function that heavily penalizes links with high packet loss
+            def loss_weight(u, v, data):
+                # Get packet loss probability, default to 1% if not defined
+                loss = data.get('packet_loss', 0.01)
+                
+                # Apply exponential scaling to heavily penalize high loss links
+                # This rapidly makes high-loss links very unattractive
+                return 1.0 + (loss * 100) ** 2
+            
+            # Use shortest path algorithm with the loss-based weight function
+            return nx.shortest_path(self.graph, source, destination, weight=loss_weight)
+        except nx.NetworkXNoPath:
+            # No path found - this is an expected condition, not an error
+            return None
+        except nx.NodeNotFound as e:
+            # This is a specific error that indicates a problem with the input
+            if not self._handle_error(e, "node_not_found", context="find_min_loss_path"):
+                raise ValueError(f"Invalid node specified in path finding: {str(e)}") from e
+            return None
+        except Exception as e:
+            # Handle unexpected errors
+            if not self._handle_error(e, "path_finding_error", context="find_min_loss_path"):
+                raise
+            return None
+    
+    def _select_next_node(self, current_node, destination, visited):
+        """Select next node using PAMR algorithm for local routing."""
+        try:
+            # First check if the current node exists in the graph
+            if current_node not in self.graph:
+                self._handle_error(ValueError(f"Current node {current_node} not in graph"), 
+                                  "node_missing", context="_select_next_node")
+                return None
+                
+            # Get neighbors, handling directed vs undirected graphs
+            try:
+                neighbors = list(self.graph.neighbors(current_node))
+            except (nx.NetworkXError, AttributeError):
+                try:
+                    neighbors = list(self.graph.successors(current_node))
+                except (nx.NetworkXError, AttributeError) as e:
+                    self._handle_error(e, "neighbor_error", context="_select_next_node")
+                    return None
+                
+            if not neighbors:
+                return None
+            
+            # Calculate selection probabilities
+            probabilities = []
+            valid_neighbors = []
+            
+            for neighbor in neighbors:
+                if neighbor in visited:
+                    continue
+                    
+                valid_neighbors.append(neighbor)
+                
+                # Get edge attributes
+                edge_data = self.graph[current_node][neighbor]
+                pheromone = self.pheromone_table[current_node].get(neighbor, 0.1)
+                distance = edge_data.get('distance', 1.0)
+                congestion = edge_data.get('congestion', 0.0)
+                bandwidth = edge_data.get('bandwidth', 1.0)
+                
+                # Use simplified congestion prediction
+                congestion_history = self.congestion_history.get((current_node, neighbor), [congestion])
+                if len(congestion_history) >= 2:
+                    # Simplified trend detection
+                    congestion_trend = congestion_history[-1] - congestion_history[0]
+                    predicted_congestion = max(0.01, min(0.99, congestion + congestion_trend))
+                else:
+                    predicted_congestion = congestion
+                
+                # Simplified desirability calculation
+                pheromone_factor = pheromone ** self.alpha
+                distance_factor = (1.0 / distance) ** self.beta
+                congestion_factor = (1.0 - predicted_congestion) ** self.gamma
+                
+                # OPTIMIZATION: For destination neighbor, give high priority
+                if neighbor == destination:
+                    # If this neighbor is the destination, give it very high priority
+                    desirability = pheromone_factor * distance_factor * congestion_factor * 10.0
+                else:
+                    bandwidth_factor = bandwidth  # Simplified
+                    
+                    # Simplified heuristic - use direct distance or hop count estimate
+                    try:
+                        # Simple topological estimate
+                        heuristic = 1.0 / (len(list(self.graph.neighbors(neighbor))) + 1)
+                        desirability = pheromone_factor * distance_factor * congestion_factor * bandwidth_factor
+                    except Exception as e:
+                        # Handle error in heuristic calculation
+                        self._handle_error(e, "heuristic_error", context="_select_next_node")
+                        desirability = pheromone_factor * distance_factor * congestion_factor * bandwidth_factor
+                
+                probabilities.append(max(0.001, desirability))  # Ensure minimum probability
+            
+            # If no valid neighbors, return None
+            if not valid_neighbors:
+                return None
+            
+            # Select next node using weighted probability
+            total = sum(probabilities)
+            if total <= 0:
+                # Handle edge case where all probabilities are zero or negative
+                self._handle_error(ValueError("Invalid probability distribution: sum <= 0"), 
+                                  "probability_error", context="_select_next_node")
+                # Fall back to equal probabilities
+                probabilities = [1.0/len(valid_neighbors)] * len(valid_neighbors)
+                total = 1.0
+            else:
+                probabilities = [p / total for p in probabilities]
+            
+            # OPTIMIZATION: Sometimes pick the highest probability option deterministically
+            if random.random() < 0.7:  # 70% of the time
+                max_prob_idx = probabilities.index(max(probabilities))
+                return valid_neighbors[max_prob_idx]
+            else:
+                # Otherwise use weighted random selection
+                try:
+                    selected_idx = np.random.choice(range(len(valid_neighbors)), p=probabilities)
+                    return valid_neighbors[selected_idx]
+                except ValueError as e:
+                    # Handle potential numpy error (e.g., probabilities don't sum to 1)
+                    self._handle_error(e, "probability_sampling_error", context="_select_next_node")
+                    # Fall back to deterministic selection
+                    max_prob_idx = probabilities.index(max(probabilities))
+                    return valid_neighbors[max_prob_idx]
+        except Exception as e:
+            # Catch any other unexpected errors
+            if not self._handle_error(e, "next_node_selection_error", context="_select_next_node"):
+                raise
+            # Default to no valid next node
+            return None
     
     def _update_core_paths(self):
-        """Update the core routing paths for all nodes using a modified Dijkstra algorithm."""
-        # Only process a subset of nodes - this significantly reduces computation time
+        """Update the core routing paths for all nodes using an optimized Dijkstra algorithm."""
+        # Get all nodes
         nodes = list(self.graph.nodes())
+        total_nodes = len(nodes)
         
-        # Process only major nodes or a random subset if we have too many nodes
-        if len(nodes) > 50:
+        # OPTIMIZATION: Use prioritized node selection for large networks
+        nodes_to_process = []
+        
+        # For very large networks, use a more aggressive pruning strategy
+        if total_nodes > 100:
+            # Identify "major" nodes based on degree and betweenness centrality approximation
+            node_importance = {}
+            
+            # Step 1: Calculate node degree (faster than centrality)
+            node_degrees = {n: len(list(self.graph.neighbors(n))) for n in nodes}
+            
+            # Step 2: Identify potential hubs (high degree nodes)
+            avg_degree = sum(node_degrees.values()) / total_nodes
+            hub_threshold = max(3, avg_degree * 1.5)
+            potential_hubs = [n for n, d in node_degrees.items() if d >= hub_threshold]
+            
+            # Step 3: Add high-degree nodes as they're likely important for routing
+            nodes_to_process.extend(sorted(potential_hubs, key=lambda n: node_degrees[n], reverse=True)[:min(25, len(potential_hubs))])
+            
+            # Step 4: Add strategic nodes based on spatial distribution
+            # Select nodes that are well-distributed throughout the network
+            remaining = set(nodes) - set(nodes_to_process)
+            if remaining and len(nodes_to_process) < 40:
+                # Use a simple greedy approach to select well-distributed nodes
+                selected_nodes = set(nodes_to_process)
+                # Start with highest degree remaining node
+                candidates = sorted(remaining, key=lambda n: node_degrees[n], reverse=True)
+                
+                while candidates and len(selected_nodes) < 40:
+                    # Select the next candidate
+                    next_node = candidates.pop(0)
+                    selected_nodes.add(next_node)
+                    
+                    # Remove neighbors of this node from candidates to ensure distribution
+                    neighbors = set(self.graph.neighbors(next_node))
+                    candidates = [n for n in candidates if n not in neighbors]
+                
+                # Add these well-distributed nodes
+                nodes_to_process.extend(selected_nodes - set(nodes_to_process))
+        
+        # For medium-sized networks, use a balanced approach
+        elif total_nodes > 50:
             # Identify "major" nodes based on degree
             node_degrees = {n: len(list(self.graph.neighbors(n))) for n in nodes}
             sorted_nodes = sorted(node_degrees.items(), key=lambda x: x[1], reverse=True)
-            major_nodes = [n for n, _ in sorted_nodes[:min(30, len(nodes)//2)]]
             
-            # Add some random nodes for coverage
+            # Take top 40% of nodes by degree, up to a maximum of 30
+            major_nodes = [n for n, _ in sorted_nodes[:min(30, int(total_nodes * 0.4))]]
+            
+            # Add some random nodes for better coverage
             remaining = set(nodes) - set(major_nodes)
             if remaining:
                 major_nodes.extend(random.sample(list(remaining), 
-                                              min(20, len(remaining))))
+                                            min(10, len(remaining))))
             nodes_to_process = major_nodes
         else:
+            # For small networks, process all nodes
             nodes_to_process = nodes
+        
+        # OPTIMIZATION: Process nodes in parallel for large networks
+        if total_nodes > 200 and hasattr(self, '_update_core_paths_parallel'):
+            self._update_core_paths_parallel()
+            return
+        
+        # OPTIMIZATION: Pre-compute edge weights once for all paths
+        # This avoids repeatedly calculating weights during Dijkstra's algorithm
+        edge_weights = {}
+        for u, v, data in self.graph.edges(data=True):
+            # Calculate composite path metric more efficiently
+            edge_distance = data.get('distance', 1.0)
+            congestion = data.get('congestion', 0.0)
+            pheromone = self.pheromone_table[u].get(v, 0.1)
+            
+            # Simplified weight calculation - less computation
+            congestion_factor = 1 + congestion * 10
+            pheromone_factor = 1 / (pheromone + 0.1)
+            edge_weights[(u, v)] = edge_distance * congestion_factor * pheromone_factor * 0.1
         
         # For each source node in our selected subset
         for source in nodes_to_process:
@@ -99,27 +379,29 @@ class PAMRRouter:
             predecessor = {node: None for node in nodes}
             distance[source] = 0
             
-            # Priority
+            # Priority queue
             pq = [(0, source)]
+            visited = set()  # Track visited nodes to avoid reprocessing
             
             while pq:
                 current_distance, current_node = heapq.heappop(pq)
                 
-                # If we've processed this node with a better distance, skip
-                if current_distance > distance[current_node]:
+                # Skip if we've already found a better path or processed this node
+                if current_node in visited or current_distance > distance[current_node]:
                     continue
+                    
+                # Mark as visited
+                visited.add(current_node)
+                
+                # OPTIMIZATION: Early termination for distant nodes in large networks
+                # Once we've visited enough nodes, stop processing
+                if len(visited) > min(total_nodes, 200) and total_nodes > 100:
+                    break
                 
                 # Process all neighbors
                 for neighbor in self.graph.neighbors(current_node):
-                    # Calculate composite path metric more efficiently
-                    edge_distance = self.graph[current_node][neighbor].get('distance', 1.0)
-                    congestion = self.graph[current_node][neighbor].get('congestion', 0.0)
-                    pheromone = self.pheromone_table[current_node].get(neighbor, 0.1)
-                    
-                    # Simplified weight calculation - less computation
-                    congestion_factor = 1 + congestion * 10
-                    pheromone_factor = 1 / (pheromone + 0.1)
-                    edge_weight = edge_distance * congestion_factor * pheromone_factor * 0.1
+                    # Use pre-computed edge weight
+                    edge_weight = edge_weights.get((current_node, neighbor), 1.0)
                     
                     # Compute new distance
                     new_distance = distance[current_node] + edge_weight
@@ -128,11 +410,18 @@ class PAMRRouter:
                     if new_distance < distance[neighbor]:
                         distance[neighbor] = new_distance
                         predecessor[neighbor] = current_node
-                        heapq.heappush(pq, (new_distance, neighbor))
+                        
+                        # OPTIMIZATION: Only add to queue if not visited
+                        if neighbor not in visited:
+                            heapq.heappush(pq, (new_distance, neighbor))
             
-            # Construct paths from predecessor map
+            # Construct paths from predecessor map - only for reachable destinations
             for destination in nodes:
                 if destination == source:
+                    continue
+                
+                # Skip unreachable destinations
+                if distance[destination] == float('infinity'):
                     continue
                     
                 if predecessor[destination] is not None:
@@ -306,8 +595,48 @@ class PAMRRouter:
         
         return alternative_paths
     
-    def find_path(self, source, destination, max_steps=100):
-        """Find a path from source to destination using PAMR."""
+    def _find_min_loss_path(self, source, destination):
+        """Find path with minimum packet loss probability.
+        
+        This is critical for high-reliability traffic and dramatically reduces
+        overall packet loss in the network.
+        
+        Args:
+            source: Source node
+            destination: Destination node
+            
+        Returns:
+            List representing the path with minimum packet loss, or None if no path found
+        """
+        try:
+            # Create a weight function that heavily penalizes links with high packet loss
+            def loss_weight(u, v, data):
+                # Get packet loss probability, default to 1% if not defined
+                loss = data.get('packet_loss', 0.01)
+                
+                # Apply exponential scaling to heavily penalize high loss links
+                # This rapidly makes high-loss links very unattractive
+                return 1.0 + (loss * 100) ** 2
+            
+            # Use shortest path algorithm with the loss-based weight function
+            return nx.shortest_path(self.graph, source, destination, weight=loss_weight)
+        except (nx.NetworkXNoPath, Exception):
+            # No path found or other error
+            return None
+    
+    def find_path(self, source, destination, max_steps=100, traffic_class='standard', ttl=None):
+        """Find a path from source to destination using PAMR with enhanced packet loss avoidance.
+        
+        Args:
+            source: Source node
+            destination: Destination node
+            max_steps: Maximum path search steps
+            traffic_class: Type of traffic (can be 'standard', 'latency_sensitive', etc.)
+            ttl: Time to live - maximum hop count for the path (None = auto determine)
+            
+        Returns:
+            Tuple of (path, quality)
+        """
         if source == destination:
             return [source], 0
         
@@ -316,36 +645,74 @@ class PAMRRouter:
         # Path key for caching
         path_key = (source, destination)
         
-        # OPTIMIZATION: Check cache first - use cached path if still valid
-        if self.use_advanced_cache and path_key in self.path_cache:
-            cache_entry = self.path_cache[path_key]
-            cache_age = self.iteration - cache_entry['iteration']
+        # IMPROVEMENT: Automatically determine TTL based on network size
+        if ttl is None:
+            # Set TTL to 1.5 times the size of the average shortest path in the network
+            # with a minimum of 15 and a maximum of 50
+            avg_path_length = 10  # Default assumption
             
-            # Use cache if it's recent enough and the congestion hasn't changed significantly
-            if cache_age < self.cache_ttl:
-                # Verify that no edge is extremely congested now
-                path = cache_entry['path']
-                max_new_congestion = 0
+            # Use network diameter as a heuristic if we haven't computed average path length
+            if hasattr(self, 'network_diameter'):
+                avg_path_length = self.network_diameter
+            elif len(self.graph) < 500:  # Only compute for reasonably sized networks
+                # Sample some paths to get an approximation
+                sample_size = min(20, len(self.graph))
+                sampled_nodes = random.sample(list(self.graph.nodes()), sample_size)
+                path_lengths = []
                 
-                for i in range(len(path) - 1):
-                    u, v = path[i], path[i+1]
-                    max_new_congestion = max(max_new_congestion, self.graph[u][v].get('congestion', 0))
+                for i in range(min(10, sample_size)):
+                    source_node = sampled_nodes[i]
+                    for j in range(i+1, min(20, sample_size)):
+                        dest_node = sampled_nodes[j]
+                        try:
+                            path = nx.shortest_path(self.graph, source_node, dest_node)
+                            path_lengths.append(len(path))
+                        except:
+                            pass
                 
-                # If congestion is reasonable, use cached path
-                if max_new_congestion < 0.6:  # Lower threshold to be more sensitive to congestion
-                    self.cache_hits += 1
+                if path_lengths:
+                    avg_path_length = sum(path_lengths) / len(path_lengths)
+                    # Cache this as network diameter for future use
+                    self.network_diameter = avg_path_length
+            
+            # Set TTL based on average path length
+            ttl = max(15, min(50, int(avg_path_length * 1.5)))
+        
+        # For latency-sensitive or high-priority traffic, prioritize low packet loss
+        is_priority_traffic = traffic_class in ['latency_sensitive', 'high_priority', 'voip', 'video']
+        
+        # OPTIMIZATION: Check cache first - use cached path if still valid
+        if self.use_advanced_cache:
+            cache_entry = self._get_from_path_cache(path_key)
+            if cache_entry:
+                cache_age = self.iteration - cache_entry['iteration']
+                
+                # Use cache if it's recent enough and the congestion hasn't changed significantly
+                # For priority traffic, use a shorter cache TTL to ensure freshness
+                cache_ttl = self.cache_ttl // 2 if is_priority_traffic else self.cache_ttl
+                
+                if cache_age < cache_ttl:
+                    # Verify that no edge is extremely congested now
+                    path = cache_entry['path']
+                    max_new_congestion = 0
+                    max_new_loss = 0
                     
-                    # Still update traffic on the path
                     for i in range(len(path) - 1):
                         u, v = path[i], path[i+1]
-                        self.graph[u][v]['traffic'] = self.graph[u][v].get('traffic', 0) + 1
-                        
-                        # Update congestion based on capacity - use same cap as elsewhere 
-                        capacity = self.graph[u][v].get('capacity', 10)
-                        new_congestion = min(0.8, self.graph[u][v]['traffic'] / capacity)
-                        self.graph[u][v]['congestion'] = new_congestion
+                        max_new_congestion = max(max_new_congestion, self.graph[u][v].get('congestion', 0))
+                        max_new_loss = max(max_new_loss, self.graph[u][v].get('packet_loss', 0.01))
                     
-                    return path, cache_entry['quality']
+                    # For priority traffic, be stricter about packet loss 
+                    max_acceptable_loss = 0.03 if is_priority_traffic else 0.08
+                    
+                    # If congestion and loss are reasonable, use cached path
+                    if max_new_congestion < 0.6 and max_new_loss < max_acceptable_loss:
+                        self.cache_hits += 1
+                        
+                        # Still update traffic on the path
+                        self._update_path_traffic(path)
+                        
+                        return path, cache_entry['quality']
         
         self.cache_misses += 1
         
@@ -353,9 +720,69 @@ class PAMRRouter:
         if self.iteration % self.path_update_interval == 0:
             self._update_core_paths()
         
+        # ENHANCEMENT: For priority traffic, try to find paths with minimal packet loss first
+        if is_priority_traffic:
+            min_loss_path = self._find_min_loss_path(source, destination)
+            
+            if min_loss_path:
+                # Verify TTL compliance - if too long, find an alternative path
+                if len(min_loss_path) > ttl:
+                    # Path exceeds TTL, try to find a shorter path
+                    pass
+                else:
+                    # Calculate path quality
+                    path_quality = self._calculate_path_quality(min_loss_path)
+                    
+                    # Update pheromones on this successful path
+                    self._update_pheromones(min_loss_path, path_quality)
+                    
+                    # Update traffic on the path
+                    self._update_path_traffic(min_loss_path)
+                    
+                    # Cache this path
+                    self._add_to_path_cache(path_key, {
+                        'path': min_loss_path, 
+                        'quality': path_quality,
+                        'iteration': self.iteration
+                    })
+                    
+                    return min_loss_path, path_quality
+        
+        # Continue with the standard path finding logic
         # Check if path is in routing table
         if source in self.routing_table and destination in self.routing_table[source]:
             primary_path = self.routing_table[source][destination]
+            
+            # IMPROVEMENT: Check if primary path exceeds TTL
+            if len(primary_path) > ttl:
+                # Try to find a shorter path using alternative methods
+                shorter_paths = []
+                
+                # 1. Try direct shortest path with hop count as weight
+                try:
+                    hop_path = nx.shortest_path(self.graph, source, destination)
+                    if len(hop_path) <= ttl:
+                        shorter_paths.append(hop_path)
+                except:
+                    pass
+                
+                # 2. Use a modified BFS to find a path within TTL
+                if not shorter_paths:
+                    try:
+                        within_ttl_path = self._find_path_within_ttl(source, destination, ttl)
+                        if within_ttl_path:
+                            shorter_paths.append(within_ttl_path)
+                    except:
+                        pass
+                
+                # If we found shorter paths, replace primary path
+                if shorter_paths:
+                    primary_path = shorter_paths[0]
+                    # Update routing table with this shorter path
+                    self.routing_table[source][destination] = primary_path
+                else:
+                    # No suitable path found within TTL
+                    return [source], -1
             
             # Only compute alternatives for severely congested paths
             all_paths = [primary_path]
@@ -367,12 +794,20 @@ class PAMRRouter:
             
             for i in sample_indices:
                 u, v = primary_path[i], primary_path[i+1]
-                if self.graph[u][v].get('congestion', 0) > self.load_balancing_threshold * 1.5:
+                
+                # ENHANCEMENT: Consider both congestion and packet loss for alternative paths
+                edge_congestion = self.graph[u][v].get('congestion', 0)
+                edge_loss = self.graph[u][v].get('packet_loss', 0.01)
+                
+                # Check if edge is problematic
+                if edge_congestion > self.load_balancing_threshold * 1.5 or edge_loss > 0.05:
                     need_alternatives = True
                     break
             
             if need_alternatives:
                 alternative_paths = self._find_alternative_paths(source, destination, primary_path)
+                # IMPROVEMENT: Filter out alternatives that exceed TTL
+                alternative_paths = [p for p in alternative_paths if len(p) <= ttl]
                 all_paths.extend(alternative_paths)
             
             # Find best path more efficiently
@@ -393,33 +828,39 @@ class PAMRRouter:
             self._update_path_traffic(best_path)
             
             # Cache this path with current iteration
-            self.path_cache[path_key] = {
+            self._add_to_path_cache(path_key, {
                 'path': best_path, 
                 'quality': best_quality,
                 'iteration': self.iteration
-            }
+            })
             
             return best_path, best_quality
         
+        # If no path in routing table, proceed with existing logic
         # OPTIMIZATION: For smaller networks, use direct shortest path
         if len(self.graph) < 50 and nx.has_path(self.graph, source, destination):
             # Use standard shortest path for small networks
             try:
                 path = nx.shortest_path(self.graph, source, destination, weight='distance')
-                path_quality = self._calculate_path_quality(path)
-                
-                # Update pheromones and traffic
-                self._update_pheromones(path, path_quality)
-                self._update_path_traffic(path)
-                
-                # Cache the path
-                self.path_cache[path_key] = {
-                    'path': path,
-                    'quality': path_quality,
-                    'iteration': self.iteration
-                }
-                
-                return path, path_quality
+                # IMPROVEMENT: Verify TTL compliance
+                if len(path) > ttl:
+                    # Path too long, try local search instead
+                    pass
+                else:
+                    path_quality = self._calculate_path_quality(path)
+                    
+                    # Update pheromones and traffic
+                    self._update_pheromones(path, path_quality)
+                    self._update_path_traffic(path)
+                    
+                    # Cache the path
+                    self._add_to_path_cache(path_key, {
+                        'path': path,
+                        'quality': path_quality,
+                        'iteration': self.iteration
+                    })
+                    
+                    return path, path_quality
             except nx.NetworkXNoPath:
                 pass
         
@@ -429,10 +870,26 @@ class PAMRRouter:
         current = source
         step_count = 0
         
+        # IMPROVEMENT: Add loop detection
+        prev_nodes = {}  # Track how we got to each node
+        
         # Simplified local search with early termination
         while current != destination and step_count < min(30, max_steps):
             next_node = self._select_next_node(current, destination, visited)
             if next_node is None:
+                break
+                
+            # IMPROVEMENT: Check for loops by verifying we're not revisiting a node's neighborhood
+            if next_node in prev_nodes:
+                # We've been here before, potential loop
+                break
+                
+            # Record how we got to next_node
+            prev_nodes[next_node] = current
+            
+            # IMPROVEMENT: Verify path length remains within TTL
+            if len(path) >= ttl:
+                # TTL exceeded, terminate search
                 break
                 
             path.append(next_node)
@@ -451,36 +908,62 @@ class PAMRRouter:
             self._update_path_traffic(path)
             
             # Cache this path
-            self.path_cache[path_key] = {
+            self._add_to_path_cache(path_key, {
                 'path': path, 
                 'quality': path_quality,
                 'iteration': self.iteration
-            }
+            })
             
             return path, path_quality
         
         # No path found
         return path, -1
     
-    def _update_path_traffic(self, path):
-        """Update traffic and congestion along a path more efficiently."""
-        if len(path) < 2:
-            return
+    def _find_path_within_ttl(self, source, destination, ttl):
+        """Find a path from source to destination within TTL hops."""
+        # Simple BFS implementation to find path within TTL
+        queue = [(source, [source])]
+        visited = {source}
+        
+        while queue:
+            node, path = queue.pop(0)
             
+            # If found destination within TTL, return path
+            if node == destination:
+                return path
+                
+            # If path length would exceed TTL, don't explore further
+            if len(path) >= ttl:
+                continue
+                
+            # Explore neighbors
+            for neighbor in self.graph.neighbors(node):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
+                    
+        # No path found within TTL
+        return None
+    
+    def _update_path_traffic(self, path):
+        """Update traffic stats for a path, ensuring history is sliceable."""
         for i in range(len(path) - 1):
             u, v = path[i], path[i+1]
-            # Update traffic counter
-            self.graph[u][v]['traffic'] = self.graph[u][v].get('traffic', 0) + 1
+            edge = (u, v)
             
-            # Update congestion based on capacity - lower cap to avoid reaching 0.95
-            capacity = self.graph[u][v].get('capacity', 10)
-            new_congestion = min(0.8, self.graph[u][v]['traffic'] / capacity)
-            self.graph[u][v]['congestion'] = new_congestion
+            # Ensure congestion_history[edge] is a list
+            if edge not in self.congestion_history:
+                self.congestion_history[edge] = []
+            elif not isinstance(self.congestion_history[edge], list):
+                self.congestion_history[edge] = [self.congestion_history[edge]]
             
-            # More efficient congestion history update
-            if len(self.congestion_history[(u, v)]) >= 20:
-                self.congestion_history[(u, v)].pop(0)
-            self.congestion_history[(u, v)].append(new_congestion)
+            # Record current congestion
+            current_congestion = self.graph[u][v].get('congestion', 0.0)
+            self.congestion_history[edge].append(current_congestion)
+            
+            # Trim history to avoid memory bloat (keep last 10 values)
+            if len(self.congestion_history[edge]) > 10:
+                self.congestion_history[edge] = self.congestion_history[edge][-10:]
     
     def _update_pheromones(self, path, quality):
         """Update pheromones along a path based on its quality."""
@@ -567,7 +1050,7 @@ class PAMRRouter:
                 try:
                     # Simple topological estimate
                     heuristic = 1.0 / (len(list(self.graph.neighbors(neighbor))) + 1)
-                    desirability = pheromone_factor * distance_factor * congestion_factor * bandwidth_factor * heuristic
+                    desirability = pheromone_factor * distance_factor * congestion_factor * bandwidth_factor
                 except:
                     desirability = pheromone_factor * distance_factor * congestion_factor * bandwidth_factor
             
@@ -591,23 +1074,26 @@ class PAMRRouter:
             return valid_neighbors[selected_idx]
     
     def _calculate_path_quality(self, path):
-        """Calculate the quality of a path with improved balancing of factors."""
+        """Calculate the quality of a path with improved packet loss avoidance, congestion handling, and stability."""
         if len(path) < 2:
             return 0
             
-        # OPTIMIZATION: Faster path quality calculation
+        # Comprehensive path quality calculation
         total_distance = 0
         max_congestion = 0
         hop_count = len(path) - 1
         
-        # Fixed parameters for computation
+        # Enhanced metrics for comprehensive quality evaluation
         min_bandwidth = float('inf')
         sum_congestion = 0
+        max_packet_loss = 0
+        sum_packet_loss = 0
         
         for i in range(len(path) - 1):
             u, v = path[i], path[i+1]
             edge_data = self.graph[u][v]
             
+            # Collect basic metrics
             distance = edge_data.get('distance', 1.0)
             total_distance += distance
             
@@ -617,42 +1103,103 @@ class PAMRRouter:
             
             bandwidth = edge_data.get('bandwidth', 1.0)
             min_bandwidth = min(min_bandwidth, bandwidth)
+            
+            # ENHANCEMENT: Consider packet loss explicitly (critical for reliability)
+            packet_loss = edge_data.get('packet_loss', 0.01)  # Default to 1% if not defined
+            sum_packet_loss += packet_loss
+            max_packet_loss = max(max_packet_loss, packet_loss)
         
-        # Simplified quality computation - much faster
+        # Comprehensive quality computation
         avg_congestion = sum_congestion / hop_count
+        avg_packet_loss = sum_packet_loss / hop_count
         
-        # Simplified quality calculation
-        delay_factor = 1.0 / (total_distance * (1 + max_congestion * 2))
-        congestion_factor = 1.0 / (1.0 + avg_congestion * 3)
-        hop_factor = 1.0 / (1.0 + hop_count * 0.1)
+        # IMPROVEMENT: Dynamic weights based on network conditions
+        # Adjust weights based on congestion levels
+        congestion_weight = 0.3
+        if max_congestion > 0.7:
+            # Increase congestion weight for highly congested networks
+            congestion_weight = 0.4
+            # Reduce distance weight to keep sum at 1.0
+            distance_weight = 0.3
+        elif max_congestion < 0.3:
+            # Reduce congestion weight for lightly congested networks
+            congestion_weight = 0.2
+            # Increase distance weight
+            distance_weight = 0.5
+        else:
+            # Default weights
+            distance_weight = 0.4
+            
+        # Similarly adjust packet loss weight based on observed loss
+        packet_loss_weight = 0.25
+        if max_packet_loss > 0.05:  # High packet loss
+            packet_loss_weight = 0.35
+            # Adjust other weights to keep sum at 1.0
+            distance_weight -= 0.1
         
-        # Final quality combining all factors
-        final_quality = (
-            delay_factor * 0.6 +     # Higher weight to delay
-            congestion_factor * 0.3 + # Medium weight to congestion
-            hop_factor * 0.1         # Lower weight to hop count
+        # Calculate remaining weight for bandwidth
+        bandwidth_weight = 1.0 - (distance_weight + congestion_weight + packet_loss_weight)
+        
+        # ENHANCEMENT: More balanced, packet-loss aware quality calculation
+        # Apply quadratic penalty to congestion to strongly penalize high congestion
+        congestion_penalty = (max_congestion ** 2) * 2
+        
+        # Apply exponential penalty to packet loss to heavily penalize lossy paths
+        # This is critical for improving overall reliability
+        packet_loss_penalty = max_packet_loss * 2.0  # Higher weight for packet loss
+        
+        # Higher penalty for paths approaching critical congestion threshold
+        high_congestion_threshold = 0.6
+        if max_congestion > high_congestion_threshold:
+            congestion_penalty *= 3  # Triple penalty for high congestion
+        
+        # Bandwidth factor - prioritize higher bandwidth when available
+        bandwidth_factor = 0.0
+        if min_bandwidth < float('inf'):
+            bandwidth_factor = 1.0 / min_bandwidth
+            bandwidth_factor = min(1.0, bandwidth_factor * 0.5)  # Cap the penalty
+        
+        # IMPROVEMENT: Add path stability factor
+        path_key = (path[0], path[-1])
+        stability_factor = 1.0  # Default: no penalty
+        
+        # Check path history for stability
+        if path_key in self.path_history and len(self.path_history[path_key]) >= 2:
+            # Calculate how often this path has been used recently
+            recent_iterations = set(entry['iteration'] for entry in self.path_history[path_key][-5:])
+            total_possible = self.iteration - min(recent_iterations) + 1
+            usage_ratio = len(recent_iterations) / total_possible if total_possible > 0 else 0
+            
+            # Higher usage ratio means more stable path
+            stability_factor = 0.5 + (usage_ratio * 0.5)  # Scale between 0.5-1.0
+        
+        # Calculate final quality score (higher is better)
+        # Inverse of the weighted sum of factors (distance, congestion, loss, bandwidth)
+        quality = 1.0 / (
+            (total_distance / hop_count) * distance_weight +
+            congestion_penalty * congestion_weight +
+            packet_loss_penalty * packet_loss_weight +
+            bandwidth_factor * bandwidth_weight +
+            0.1  # Prevent division by zero
         )
         
-        # Store minimal path history
-        path_key = (path[0], path[-1])
-        if path_key not in self.path_history:
-            self.path_history[path_key] = []
-            
-        # Store only essential metrics
+        # Apply stability bonus (more stable paths get higher quality)
+        quality *= stability_factor
+        
+        # Store path history with enhanced metrics - use the memory-efficient method
         compact_path_data = {
             'iteration': self.iteration,
-            'quality': final_quality,
-            'congestion': max_congestion
+            'quality': quality,
+            'congestion': max_congestion,
+            'packet_loss': max_packet_loss,
+            'bandwidth': min_bandwidth,
+            'stability': stability_factor
         }
         
-        self.path_history[path_key].append(compact_path_data)
-        
-        # Limit history size more aggressively
-        if len(self.path_history[path_key]) > 5:
-            self.path_history[path_key].pop(0)
+        self._add_to_path_history(path_key, compact_path_data)
             
-        return final_quality
-        
+        return quality
+    
     def update_iteration(self):
         """Update the iteration counter and perform periodic maintenance."""
         self.iteration += 1
@@ -851,8 +1398,70 @@ class PAMRRouter:
             
             # Update congestion history
             if len(self.congestion_history[(u, v)]) >= 20:
-                self.congestion_history[(u, v)].pop(0)
+                self.congestion_history[(u, v)].popleft()  # Use popleft() for deque instead of pop(0)
             self.congestion_history[(u, v)].append(self.graph[u][v]['congestion'])
+    
+    def _add_to_path_cache(self, key, value):
+        """Add an entry to the path cache with LRU eviction policy."""
+        # If key already exists, update its position in the LRU tracking
+        if key in self.path_cache:
+            try:
+                self.path_cache_keys.remove(key)
+            except ValueError:
+                # Key wasn't in the deque, which shouldn't happen but handle gracefully
+                pass
+        elif len(self.path_cache) >= self.path_cache_size:
+            # Cache is full, evict least recently used item
+            if self.path_cache_keys:
+                oldest_key = self.path_cache_keys.popleft()
+                if oldest_key in self.path_cache:
+                    del self.path_cache[oldest_key]
+        
+        # Add/update the entry
+        self.path_cache[key] = value
+        self.path_cache_keys.append(key)
+    
+    def _get_from_path_cache(self, key):
+        """Get an entry from the path cache, updating its LRU status."""
+        if key in self.path_cache:
+            # Update LRU status
+            try:
+                self.path_cache_keys.remove(key)
+                self.path_cache_keys.append(key)
+            except ValueError:
+                # Key wasn't in the deque, which shouldn't happen but handle gracefully
+                self.path_cache_keys.append(key)
+            return self.path_cache[key]
+        return None
+    
+    def _add_to_path_history(self, path_key, data):
+        """Add data to path history with size limits."""
+        # Ensure path_history doesn't grow too large
+        if len(self.path_history) >= self.max_path_history_entries and path_key not in self.path_history:
+            # Find least recently used entry to evict
+            oldest_path = None
+            oldest_iteration = float('inf')
+            
+            # This could be optimized with a separate LRU tracker
+            for p, history in self.path_history.items():
+                if history and history[0]['iteration'] < oldest_iteration:
+                    oldest_iteration = history[0]['iteration']
+                    oldest_path = p
+            
+            # Remove oldest entry if found
+            if oldest_path:
+                del self.path_history[oldest_path]
+        
+        # Create entry if it doesn't exist
+        if path_key not in self.path_history:
+            self.path_history[path_key] = []
+        
+        # Add new data
+        self.path_history[path_key].append(data)
+        
+        # Limit history size per path
+        if len(self.path_history[path_key]) > self.max_history_per_path:
+            self.path_history[path_key].pop(0)
     
 class AdvancedMultiPathRouter(PAMRRouter):
     """
@@ -862,6 +1471,12 @@ class AdvancedMultiPathRouter(PAMRRouter):
     
     def __init__(self, graph, alpha=2.0, beta=3.0, gamma=8.0, adapt_weights=True):
         """Initialize with enhanced path discovery and traffic distribution capabilities"""
+        # Initialize error tracking first to avoid initialization errors
+        self.error_counter = defaultdict(int)
+        self.last_error = None
+        self.consecutive_errors = 0
+        
+        # Call parent constructor
         super().__init__(graph, alpha, beta, gamma, adapt_weights)
         
         # Enhanced multi-path parameters
