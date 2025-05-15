@@ -1386,20 +1386,40 @@ class PAMRRouter:
                     self._update_paths_for_node(source)
 
     def decay_traffic(self):
-        """Decay traffic over time to simulate packets leaving the network."""
-        for u, v in self.graph.edges():
-            # Traffic decays exponentially over time
-            current_traffic = self.graph[u][v].get('traffic', 0)
-            self.graph[u][v]['traffic'] = max(0, current_traffic * 0.9)
-            
-            # Recalculate congestion based on decayed traffic
-            capacity = self.graph[u][v].get('capacity', 10)
-            self.graph[u][v]['congestion'] = self.graph[u][v]['traffic'] / capacity
-            
-            # Update congestion history
-            if len(self.congestion_history[(u, v)]) >= 20:
-                self.congestion_history[(u, v)].popleft()  # Use popleft() for deque instead of pop(0)
-            self.congestion_history[(u, v)].append(self.graph[u][v]['congestion'])
+        """Decay traffic on all edges to simulate packets leaving the network."""
+        # For each edge in the graph
+        for u in self.graph:
+            for v in self.graph[u]:
+                # Decay traffic on this edge
+                self.graph[u][v]['traffic'] = self.graph[u][v].get('traffic', 0) * self.traffic_decay
+                
+                # Update congestion based on traffic/capacity ratio
+                capacity = self.graph[u][v].get('capacity', 1.0)
+                new_congestion = self.graph[u][v]['traffic'] / capacity
+                self.graph[u][v]['congestion'] = new_congestion
+                
+                # Update congestion history
+                if (u, v) in self.congestion_history:
+                    # Check if it's a deque or a list
+                    if hasattr(self.congestion_history[(u, v)], 'popleft'):
+                        # It's a deque, use popleft
+                        self.congestion_history[(u, v)].popleft()
+                    elif isinstance(self.congestion_history[(u, v)], list) and len(self.congestion_history[(u, v)]) > 0:
+                        # It's a list, use pop(0)
+                        self.congestion_history[(u, v)].pop(0)
+                    
+                    # Ensure it's a list if not already
+                    if not isinstance(self.congestion_history[(u, v)], list):
+                        self.congestion_history[(u, v)] = [new_congestion]
+                    else:
+                        self.congestion_history[(u, v)].append(new_congestion)
+                else:
+                    # Initialize history
+                    self.congestion_history[(u, v)] = [new_congestion]
+                
+                # Limit history length
+                if isinstance(self.congestion_history[(u, v)], list) and len(self.congestion_history[(u, v)]) > self.history_length:
+                    self.congestion_history[(u, v)] = self.congestion_history[(u, v)][-self.history_length:]
     
     def _add_to_path_cache(self, key, value):
         """Add an entry to the path cache with LRU eviction policy."""

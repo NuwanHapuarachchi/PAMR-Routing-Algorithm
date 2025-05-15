@@ -26,13 +26,19 @@ from matplotlib.colors import LinearSegmentedColormap
 from IPython.display import HTML
 from matplotlib import animation
 import warnings
-warnings.filterwarnings("ignore")
+from argparse import ArgumentParser
 
 # Add parent directory to path for importing the PAMR package
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import PAMR components - use custom network topology to avoid debug printouts
 from pamr.core.routing import PAMRRouter, AdvancedMultiPathRouter
+from pamr.core.network import NetworkTopology
+from pamr.simulation.simulator import PAMRSimulator
+from pamr.visualization.network_viz import NetworkVisualizer
+
+# Import the new Mininet simulator
+from pamr.simulation.mininet_sim import PAMRMininetSimulator
 
 # Custom network topology class to avoid the debug printouts in the original
 class CleanNetworkTopology:
@@ -1164,72 +1170,79 @@ class RoutingVisualizer:
         
         return all_paths, all_qualities, all_congestion
 
-def run_visualization_test():
-    """Run a test of the Advanced Multi-Path routing visualization with sophisticated path discovery"""
-    try:
-        # Create output directory
-        output_dir = './visualization_results'
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Import the singleton network from core.network
-        from pamr.core.network import network
-        
-        print("Creating advanced multi-path routing visualizer...")
-        
-        # Create the advanced multi-path router using the imported network
-        router = AdvancedMultiPathRouter(
-            network.graph, 
-            alpha=2.0,    # Pheromone importance
-            beta=3.0,     # Distance importance
-            gamma=10.0,   # Congestion importance - higher values avoid congestion more
-            adapt_weights=True
-        )
-        
-        # Create visualizer with advanced router
-        visualizer = RoutingVisualizer(
-            num_nodes=network.num_nodes, 
-            connectivity=network.connectivity, 
-            seed=network.seed, 
-            gamma=10.0
-        )
-        visualizer.router = router  # Replace default router with advanced router
-        visualizer.network = network  # Replace default network with the singleton network
-        
-        # Choose source and destination 
-        source = 2  
-        destination = 3  
-        
-        print(f"Selected source={source}, destination={destination}")
-        print(f"Using advanced multi-path router with up to {router.max_paths_to_discover} diverse paths")
-        print(f"Will simultaneously distribute traffic across up to {router.max_paths_to_use} paths")
-        
-        # Use advanced multi-path routing with fewer packets for testing
-        visualizer.send_packets_multi_path(
-            source=source, 
-            destination=destination, 
-            num_packets=30,  # Restored to original value
-            visualize=True,
-            output_path=os.path.join(output_dir, 'routing_animation.png')
-        )
-        
-        # Create metric visualizations
-        metrics_path = visualizer.visualize_metrics(output_dir)
-        
-        # Open the metrics visualization
-        webbrowser.open(f"file:///{os.path.abspath(metrics_path)}")
-        
-        print("\nExperiment complete!")
-        print(f"Results available in: {os.path.abspath(output_dir)}")
-        
-        # Show path visualization
-        path_changes_file = os.path.join(output_dir, f'path_changes_{source}_to_{destination}.png')
-        if os.path.exists(path_changes_file):
-            webbrowser.open(f"file:///{os.path.abspath(path_changes_file)}")
-            
-    except Exception as e:
-        print(f"Error during visualization: {e}")
-        import traceback
-        traceback.print_exc()
+def main():
+    parser = ArgumentParser(description='Visualize dynamic routing with PAMR protocol')
+    parser.add_argument('--nodes', type=int, default=10, help='Number of nodes in the network')
+    parser.add_argument('--connectivity', type=float, default=0.3, help='Connectivity parameter for network generation')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--iterations', type=int, default=10, help='Number of routing iterations to simulate')
+    parser.add_argument('--packets', type=int, default=50, help='Number of packets to route per iteration')
+    parser.add_argument('--use-mininet', action='store_true', help='Use Mininet for simulation and visualization')
+    args = parser.parse_args()
+    
+    # Create network topology
+    network = NetworkTopology(
+        num_nodes=args.nodes,
+        connectivity=args.connectivity,
+        seed=args.seed
+    )
 
-if __name__ == "__main__":
-    run_visualization_test()
+    # If using Mininet, run a Mininet simulation
+    if args.use_mininet:
+        from mininet.log import setLogLevel
+        setLogLevel('info')
+        
+        # Create output directory
+        os.makedirs("mininet_results", exist_ok=True)
+        
+        # Create a Mininet simulator
+        simulator = PAMRMininetSimulator()
+        
+        # Build Mininet topology from PAMR network
+        simulator.build_from_pamr_network(network)
+        
+        # Visualize the network topology before starting
+        simulator.visualize_network(
+            title="PAMR Network in Mininet",
+            save_path="mininet_results/mininet_topology.png"
+        )
+        
+        print("Starting Mininet simulation. Press Ctrl+D to exit the Mininet CLI when done.")
+        
+        # Start the simulation
+        try:
+            net = simulator.start()
+            
+            # Generate some traffic between random nodes
+            nodes = list(network.graph.nodes())
+            for i in range(min(3, len(nodes))):
+                source = nodes[i]
+                destination = nodes[(i + len(nodes)//2) % len(nodes)]
+                
+                # Run an experiment
+                print(f"\nRouting from {source} to {destination}:")
+                result = simulator.run_experiment(source, destination, protocol='pamr', num_packets=args.packets)
+                
+                # Visualize the result
+                if result['path']:
+                    simulator.visualize_network(
+                        title=f"PAMR Path from {source} to {destination}",
+                        highlight_path=result['path'],
+                        save_path=f"mininet_results/path_{source}_to_{destination}.png"
+                    )
+            
+            # Allow user to interact with the network
+            simulator.run_cli()
+            
+        finally:
+            # Stop the simulation
+            simulator.stop()
+            
+        print("Mininet simulation complete. Check 'mininet_results' directory for visualization results.")
+        return
+    
+    # Otherwise, run the original visualization
+    # ... existing code ...
+
+if __name__ == '__main__':
+    main()
